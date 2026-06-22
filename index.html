@@ -390,10 +390,11 @@ const CATEGORIES=['Cleaning','Supplies','Maintenance','Utilities','Platform fees
 
 let db = load();
 function load(){
-  let d={basePrice:75, bookings:[], overrides:{}, expenses:[]};
+  let d={basePrice:75, bookings:[], overrides:{}, expenses:[], feeds:[]};
   try{ const s=JSON.parse(localStorage.getItem(KEY)); if(s) d=Object.assign(d,s); }catch(e){}
   if(!Array.isArray(d.expenses)) d.expenses=[]; // migrate older saves
-  return d; // overrides: {"YYYY-MM-DD":{price,note}}, expenses:[{id,date,category,amount,note}]
+  if(!Array.isArray(d.feeds)) d.feeds=[];
+  return d; // overrides: {date:{price,note}}, expenses:[{...}], feeds:[{id,source,url,lastChecked,lastResult}]
 }
 let cloud={app:null,auth:null,fs:null,_auth:null,_fs:null,uid:null,email:null,
   ready:false,applying:false,firstSnap:false,unsub:null,lastPushed:null,lastSync:null};
@@ -847,9 +848,12 @@ function importICS(text,source){
     const ci=icsDate(ev.start),co=icsDate(ev.end);
     if(!ci||!co||co<=ci){skipped++;return;}
     const sum=(ev.summary||'').toLowerCase();
-    if(sum.includes('not available')||sum.includes('blocked')||sum.includes('unavailable')){skipped++;return;}
+    const isBlock=sum.includes('not available')||sum.includes('unavailable')||sum.includes('blocked');
+    // Airbnb marks host-blocks as "Not available" (real bookings say "Reserved"); Booking.com/VRBO export
+    // reservations themselves as "CLOSED - Not available", so only skip these for Airbnb.
+    if(source==='airbnb' && isBlock){skipped++;return;}
     let guest=(ev.summary||'').trim();
-    if(!guest||/^reserved$/i.test(guest))guest='Reserved ('+srcName(source)+')';
+    if(!guest||/^reserved$/i.test(guest)||isBlock||/closed/i.test(guest))guest='Reserved ('+srcName(source)+')';
     const existing=ev.uid?db.bookings.find(b=>b.icsUid===ev.uid):null;
     if(existing){existing.checkIn=ci;existing.checkOut=co;updated++;return;}
     let tot=0;bookingDatesRange(ci,co).forEach(d=>tot+=priceForDate(d));
@@ -861,43 +865,85 @@ function importICS(text,source){
   save();refreshAll();
   return {added,updated,skipped};
 }
-function openSyncModal(){
-  modal('Sync calendar (.ics)',`
-    <p style="color:var(--muted);margin:0 0 14px;font-size:13px;line-height:1.5">
-      In Airbnb: <b>Calendar → Availability → Connect calendars → Export calendar</b>, then copy the link or download the file.
-      Booking.com & VRBO export the same way. Import it below.</p>
-    <div class="field"><label>This calendar is from</label>
-      <select id="ics_source">${SOURCES.map(s=>`<option value="${s.id}" ${s.id==='airbnb'?'selected':''}>${s.name}</option>`).join('')}</select></div>
-    <div class="field"><label>Option A — Upload the .ics file</label>
-      <input type="file" id="ics_file" accept=".ics,text/calendar"></div>
-    <div class="field"><label>Option B — Paste the calendar URL or file contents</label>
-      <textarea id="ics_text" rows="3" placeholder="https://www.airbnb.com/calendar/ical/12345.ics  — or paste the file contents"></textarea></div>
-    <div class="calc-note" id="ics_note">Blocked / "Not available" dates are skipped. Re-importing updates existing bookings instead of duplicating them.</div>
-  `,[{label:'Import',cls:'btn primary',act:doImport}]);
-  document.getElementById('ics_file').addEventListener('change',e=>{
-    const f=e.target.files[0];if(!f)return;const r=new FileReader();
-    r.onload=()=>{document.getElementById('ics_text').value=r.result;toast('File loaded — click Import');};
-    r.readAsText(f);
-  });
-  async function doImport(){
-    const source=val('ics_source');
-    let text=document.getElementById('ics_text').value.trim();
-    const note=document.getElementById('ics_note');
-    if(!text){toast('Choose a file or paste a URL / contents');return;}
-    if(/^https?:\/\//i.test(text)){
-      note.textContent='Fetching calendar…';
-      try{const res=await fetch(text);text=await res.text();}
-      catch(err){
-        note.innerHTML='<b style="color:#c0392b">Couldn\'t fetch that URL.</b> Browsers block this when the app runs from a local file. Use <b>Option A</b>: download the .ics from Airbnb and upload it instead.';
-        return;
-      }
-    }
-    if(!text.includes('BEGIN:VEVENT')){toast('That doesn\'t look like a calendar (.ics) file');return;}
-    const r=importICS(text,source);
-    closeModal();
-    toast(`Imported ${r.added} new · ${r.updated} updated · ${r.skipped} skipped`);
-    show('bookings');
+// Calendar links can't be fetched cross-origin by the browser, so requests go through a fetch helper (CORS proxy).
+const DEFAULT_PROXY='https://api.allorigins.win/raw?url=';
+const getProxy=()=>localStorage.getItem('staymanager_proxy')||DEFAULT_PROXY;
+async function fetchICS(url){
+  try{ const r=await fetch(url); if(r.ok){const t=await r.text(); if(t.includes('BEGIN:VEVENT'))return t;} }catch(e){} // try direct first
+  const r=await fetch(getProxy()+encodeURIComponent(url));
+  if(!r.ok)throw new Error('fetch failed ('+r.status+')');
+  const t=await r.text();
+  if(!t.includes('BEGIN:VEVENT'))throw new Error('not a calendar feed');
+  return t;
+}
+async function checkAllFeeds(silent){
+  if(!db.feeds||!db.feeds.length){ if(!silent)toast('No calendar links saved yet'); return; }
+  let added=0,updated=0,errors=0;
+  for(const f of db.feeds){
+    try{ const text=await fetchICS(f.url); const r=importICS(text,f.source);
+      added+=r.added; updated+=r.updated; f.lastChecked=Date.now(); f.lastResult=`${r.added} new, ${r.updated} updated`; }
+    catch(e){ errors++; f.lastChecked=Date.now(); f.lastResult='⚠ '+(e.message||e); }
   }
+  save(); refreshAll();
+  if(added>0)toast(`✅ ${added} new booking(s) imported`);
+  else if(!silent)toast(errors?`Checked — ${errors} link(s) had errors`:'No new bookings found');
+}
+function timeAgo(ts){ if(!ts)return'never'; const s=Math.floor((Date.now()-ts)/1000);
+  if(s<60)return'just now'; const m=Math.floor(s/60); if(m<60)return m+'m ago';
+  const h=Math.floor(m/60); if(h<24)return h+'h ago'; return Math.floor(h/24)+'d ago'; }
+function shortUrl(u){ try{const x=new URL(u);const p=x.pathname; return x.hostname+(p.length>22?p.slice(0,22)+'…':p);}catch(e){return String(u).slice(0,40);} }
+function renderFeedList(){
+  const el=document.getElementById('feedList'); if(!el)return;
+  if(!db.feeds||!db.feeds.length){ el.innerHTML='<p style="color:var(--muted);font-size:13px;margin:4px 0 12px">No calendar links saved yet. Add one below ⬇</p>'; return; }
+  el.innerHTML=db.feeds.map(f=>`<div style="display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--line)">
+    <span class="src-tag" style="background:${srcColor(f.source)};flex:0 0 auto">${srcName(f.source)}</span>
+    <span style="flex:1;min-width:0"><small style="display:block;word-break:break-all">${esc(shortUrl(f.url))}</small>
+      <small style="color:var(--muted)">${f.lastChecked?('Checked '+timeAgo(f.lastChecked)+' · '+esc(f.lastResult||'')):'Not checked yet'}</small></span>
+    <button class="btn sm danger" data-feeddel="${f.id}" style="flex:0 0 auto">Remove</button>
+  </div>`).join('');
+  el.querySelectorAll('[data-feeddel]').forEach(b=>b.onclick=()=>{db.feeds=db.feeds.filter(x=>x.id!==b.dataset.feeddel);save();renderFeedList();toast('Link removed');});
+}
+function openSyncModal(){
+  modal('Auto-sync calendars (.ics)',`
+    <p style="color:var(--muted);margin:0 0 12px;font-size:13px;line-height:1.5">
+      In each platform open <b>Export calendar</b> (Airbnb: Calendar → Availability → Connect calendars) and paste the link here once.
+      The app re-checks your links automatically on open, and on <b>Check now</b>. Calendar links only contain <b>booked dates</b> — no guest name or price.</p>
+    <div id="feedList"></div>
+    <div class="field" style="margin-bottom:8px"><label>Add a calendar link</label>
+      <select id="feed_source" style="margin-bottom:8px">${SOURCES.map(s=>`<option value="${s.id}">${s.name}</option>`).join('')}</select>
+      <input type="url" id="feed_url" placeholder="https://www.airbnb.com/calendar/ical/12345.ics?s=..."></div>
+    <div style="display:flex;gap:8px;margin-bottom:14px">
+      <button class="btn sm primary" id="addFeedBtn">+ Save link</button>
+      <button class="btn sm" id="checkNowBtn">🔄 Check now</button>
+    </div>
+    <details><summary style="cursor:pointer;font-size:13px;color:var(--muted)">Advanced · privacy · one-time file import</summary>
+      <div class="field" style="margin-top:12px"><label>Fetch helper (CORS proxy)</label>
+        <input type="text" id="feed_proxy" placeholder="${DEFAULT_PROXY}">
+        <p style="color:var(--muted);font-size:12px;margin:6px 0 0">Browsers can't fetch calendar links directly, so requests pass through this helper. Leave blank for the default, or paste your own (e.g. a Cloudflare Worker) so links stay private.</p></div>
+      <div class="field"><label>Import a .ics file once</label><input type="file" id="ics_file" accept=".ics,text/calendar"></div>
+    </details>
+    <div class="calc-note" id="sync_note" style="margin-top:14px">Re-checking <b>updates</b> existing bookings — it never creates duplicates. Booked .ics dates have no guest details, so open a booking to add the guest name.</div>
+  `,[{label:'Done',cls:'btn primary',act:closeModal}]);
+  renderFeedList();
+  document.getElementById('feed_proxy').value=localStorage.getItem('staymanager_proxy')||'';
+  document.getElementById('addFeedBtn').onclick=()=>{
+    const url=val('feed_url').trim();
+    if(!/^https?:\/\//i.test(url)){toast('Paste a valid https calendar link');return;}
+    db.feeds=db.feeds||[];
+    db.feeds.push({id:'f'+Date.now()+Math.floor(Math.random()*9999),source:val('feed_source'),url,lastChecked:0,lastResult:''});
+    save(); document.getElementById('feed_url').value=''; renderFeedList(); toast('Link saved — click Check now');
+  };
+  document.getElementById('checkNowBtn').onclick=async()=>{
+    const p=val('feed_proxy').trim(); if(p)localStorage.setItem('staymanager_proxy',p); else localStorage.removeItem('staymanager_proxy');
+    const note=document.getElementById('sync_note'); note.textContent='Checking your calendars…';
+    await checkAllFeeds(false); renderFeedList();
+    note.innerHTML='Re-checking <b>updates</b> existing bookings — it never creates duplicates.';
+  };
+  const fileEl=document.getElementById('ics_file');
+  if(fileEl)fileEl.addEventListener('change',e=>{const f=e.target.files[0];if(!f)return;const r=new FileReader();
+    r.onload=()=>{ if(!r.result.includes('BEGIN:VEVENT')){toast('Not a valid .ics file');return;}
+      const res=importICS(r.result,val('feed_source')); toast(`Imported ${res.added} new · ${res.updated} updated`); };
+    r.readAsText(f);});
 }
 document.getElementById('syncBtn').onclick=openSyncModal;
 
@@ -953,8 +999,9 @@ function applyRemote(remote){
   try{
     const d=JSON.parse(remote);
     cloud.applying=true;
-    db=Object.assign({basePrice:75,bookings:[],overrides:{},expenses:[]},d);
+    db=Object.assign({basePrice:75,bookings:[],overrides:{},expenses:[],feeds:[]},d);
     if(!Array.isArray(db.expenses))db.expenses=[];
+    if(!Array.isArray(db.feeds))db.feeds=[];
     localStorage.setItem(KEY,JSON.stringify(db));
     cloud.lastPushed=remote;
     refreshAll();
@@ -1088,7 +1135,7 @@ document.getElementById('importFile').onchange=e=>{
 function confirmModalReplace(d){
   modal('Restore backup?',`<p style="color:var(--muted);margin:0">This will replace your current data with the backup
     (${(d.bookings||[]).length} bookings). Make sure you have a backup of current data first.</p>`,[
-    {label:'Restore',cls:'btn primary',act:()=>{db=Object.assign({basePrice:75,bookings:[],overrides:{},expenses:[]},d);if(!Array.isArray(db.expenses))db.expenses=[];save();closeModal();refreshAll();toast('Backup restored');}}
+    {label:'Restore',cls:'btn primary',act:()=>{db=Object.assign({basePrice:75,bookings:[],overrides:{},expenses:[],feeds:[]},d);if(!Array.isArray(db.expenses))db.expenses=[];if(!Array.isArray(db.feeds))db.feeds=[];save();closeModal();refreshAll();toast('Backup restored');}}
   ]);
 }
 
@@ -1107,6 +1154,9 @@ show('dashboard');
 // restore cloud sync session if previously set up
 updateCloudBtn();
 if(getCfg()){ initCloud().catch(()=>toast('Could not load cloud sync — check your internet')); }
+
+// auto-check saved calendar feeds shortly after load (silent unless new bookings arrive)
+if((db.feeds||[]).length){ setTimeout(()=>checkAllFeeds(true),1500); }
 </script>
 </body>
 </html>
