@@ -142,6 +142,41 @@
   .src-bd{display:flex;gap:8px;flex-wrap:wrap}
   .src-bd .chip{padding:6px 12px;border-radius:10px;color:#fff;font-weight:700;font-size:13px}
 
+  /* Horizontal-scroll wrapper so wide tables never stretch the page */
+  .table-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+
+  /* Mobile / phone layout */
+  @media(max-width:600px){
+    header{flex-wrap:wrap;gap:8px;padding:10px 12px}
+    .logo{font-size:17px}
+    nav{order:3;width:100%;flex-wrap:nowrap;overflow-x:auto;gap:4px;padding-bottom:2px}
+    nav button{flex:0 0 auto;padding:8px 13px}
+    .head-actions{flex:1;justify-content:flex-end;flex-wrap:wrap;gap:6px}
+    .head-actions .btn.sm{padding:6px 10px;font-size:12.5px}
+    main{padding:18px 12px 70px}
+    h1.page{font-size:21px}
+    .sub{margin-bottom:16px}
+    #dashLower{grid-template-columns:1fr!important}
+    #expStats{grid-template-columns:1fr 1fr!important}
+    .report-summary{grid-template-columns:1fr 1fr}
+    .table-scroll table{min-width:560px}
+    th,td{padding:10px 9px}
+    .toolbar input[type=search]{min-width:0;flex:1 1 100%}
+    .toolbar select{flex:1 1 auto}
+    .cal-head{gap:8px}
+    .cal-head h2{min-width:0;font-size:17px;flex:1;text-align:center}
+    .cal-grid{gap:3px}
+    .day{min-height:72px;padding:5px;border-radius:8px}
+    .day .num{font-size:12px}
+    .day .price{font-size:10px}
+    .pill{font-size:9.5px;padding:1px 4px}
+    .modal{padding:20px 18px}
+    .row2,.row3{grid-template-columns:1fr}
+    .report{overflow-x:auto}
+    .report-head{flex-direction:column;gap:8px}
+    .report-head h2{font-size:20px}
+  }
+
   /* Print */
   @media print{
     header,.no-print{display:none!important}
@@ -235,14 +270,14 @@
       <div class="spacer"></div>
       <button class="btn primary" id="newBookingBtn2">+ New Booking</button>
     </div>
-    <div class="card" style="padding:0;overflow:hidden">
-      <table id="bookingsTable">
+    <div class="card" style="padding:0">
+      <div class="table-scroll"><table id="bookingsTable">
         <thead><tr>
           <th>Guest</th><th>Source</th><th>Check-in</th><th>Check-out</th>
           <th>Nights</th><th>Guests</th><th>Total</th><th>Status</th><th></th>
         </tr></thead>
         <tbody id="bookingsBody"></tbody>
-      </table>
+      </table></div>
       <div id="bookingsEmpty" class="empty-state hidden">
         <div class="big">🛏️</div>
         <p>No bookings yet.<br>Click <b>+ New Booking</b> to add your first one.</p>
@@ -270,10 +305,10 @@
         <div class="spacer"></div>
         <button class="btn sm primary" id="addOverrideBtn">+ Add override</button>
       </div>
-      <table id="overrideTable">
+      <div class="table-scroll"><table id="overrideTable">
         <thead><tr><th>Date</th><th>Price</th><th>Note</th><th></th></tr></thead>
         <tbody id="overrideBody"></tbody>
-      </table>
+      </table></div>
       <div id="overrideEmpty" class="empty-state hidden">
         <div class="big">💰</div>
         <p>No custom prices yet. Add overrides for weekends, holidays or peak season.</p>
@@ -292,11 +327,11 @@
       <div class="spacer"></div>
       <button class="btn primary" id="addExpenseBtn">+ Add expense</button>
     </div>
-    <div class="card" style="padding:0;overflow:hidden">
-      <table>
+    <div class="card" style="padding:0">
+      <div class="table-scroll"><table>
         <thead><tr><th>Date</th><th>Category</th><th>Note</th><th>Amount</th><th></th></tr></thead>
         <tbody id="expBody"></tbody>
-      </table>
+      </table></div>
       <div id="expEmpty" class="empty-state hidden">
         <div class="big">🧾</div>
         <p>No expenses logged yet.<br>Click <b>+ Add expense</b> to track cleaning, supplies, fees and more.</p>
