@@ -1019,8 +1019,14 @@ function saveCfg(o){localStorage.setItem(CFGKEY,JSON.stringify(o));}
 function parseCfg(text){
   let t=(text||'').trim();
   if(t && t[0]!=='{' && t.indexOf('apiKey')<0){ try{t=atob(t);}catch(e){} } // maybe a "phone setup code"
-  const a=t.indexOf('{'),b=t.lastIndexOf('}');
-  if(a<0||b<0)throw 0; t=t.slice(a,b+1);
+  const key=t.indexOf('apiKey');
+  if(key>=0){ // pull out just the { ... } object around apiKey, ignoring any import lines / trailing code
+    const open=t.lastIndexOf('{',key);
+    if(open>=0){ let depth=0,end=-1;
+      for(let i=open;i<t.length;i++){ if(t[i]==='{')depth++; else if(t[i]==='}'){ if(--depth===0){end=i;break;} } }
+      if(end>0)t=t.slice(open,end+1);
+    }
+  } else { const a=t.indexOf('{'),b=t.lastIndexOf('}'); if(a<0||b<0)throw 0; t=t.slice(a,b+1); }
   let o;try{o=JSON.parse(t);}catch(e){o=Function('return ('+t+')')();}
   if(!o||!o.apiKey||!o.projectId)throw 0; return o;
 }
