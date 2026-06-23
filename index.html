@@ -390,11 +390,12 @@ const CATEGORIES=['Cleaning','Supplies','Maintenance','Utilities','Platform fees
 
 let db = load();
 function load(){
-  let d={basePrice:75, bookings:[], overrides:{}, expenses:[], feeds:[]};
+  let d={basePrice:75, bookings:[], overrides:{}, expenses:[], feeds:[], gmailSheet:''};
   try{ const s=JSON.parse(localStorage.getItem(KEY)); if(s) d=Object.assign(d,s); }catch(e){}
   if(!Array.isArray(d.expenses)) d.expenses=[]; // migrate older saves
   if(!Array.isArray(d.feeds)) d.feeds=[];
-  return d; // overrides: {date:{price,note}}, expenses:[{...}], feeds:[{id,source,url,lastChecked,lastResult}]
+  if(typeof d.gmailSheet!=='string') d.gmailSheet='';
+  return d; // feeds:[{id,source,url,...}], gmailSheet: published Google Sheet CSV url filled by the Gmail script
 }
 let cloud={app:null,auth:null,fs:null,_auth:null,_fs:null,uid:null,email:null,
   ready:false,applying:false,firstSnap:false,unsub:null,lastPushed:null,lastSync:null};
@@ -868,25 +869,75 @@ function importICS(text,source){
 // Calendar links can't be fetched cross-origin by the browser, so requests go through a fetch helper (CORS proxy).
 const DEFAULT_PROXY='https://api.allorigins.win/raw?url=';
 const getProxy=()=>localStorage.getItem('staymanager_proxy')||DEFAULT_PROXY;
-async function fetchICS(url){
-  try{ const r=await fetch(url); if(r.ok){const t=await r.text(); if(t.includes('BEGIN:VEVENT'))return t;} }catch(e){} // try direct first
+// fetch a url, trying direct first then the CORS proxy; looksValid() lets us reject error pages from the direct try
+async function fetchVia(url,looksValid){
+  try{ const r=await fetch(url); if(r.ok){const t=await r.text(); if(!looksValid||looksValid(t))return t;} }catch(e){}
   const r=await fetch(getProxy()+encodeURIComponent(url));
   if(!r.ok)throw new Error('fetch failed ('+r.status+')');
-  const t=await r.text();
-  if(!t.includes('BEGIN:VEVENT'))throw new Error('not a calendar feed');
-  return t;
+  return await r.text();
+}
+async function fetchICS(url){ const t=await fetchVia(url,x=>x.includes('BEGIN:VEVENT'));
+  if(!t.includes('BEGIN:VEVENT'))throw new Error('not a calendar feed'); return t; }
+const fetchText=url=>fetchVia(url,null);
+
+// --- Google Sheet (Gmail bridge) import ---
+function parseCSV(text){
+  const rows=[];let row=[],cur='',q=false;
+  for(let i=0;i<text.length;i++){const c=text[i];
+    if(q){ if(c==='"'){ if(text[i+1]==='"'){cur+='"';i++;} else q=false; } else cur+=c; }
+    else if(c==='"')q=true;
+    else if(c===','){row.push(cur);cur='';}
+    else if(c==='\n'){row.push(cur);rows.push(row);row=[];cur='';}
+    else if(c!=='\r')cur+=c;
+  }
+  if(cur.length||row.length){row.push(cur);rows.push(row);}
+  return rows;
+}
+function normDate(s){ s=(s||'').trim(); const m=s.match(/(\d{4})-(\d{2})-(\d{2})/); if(m)return m[0];
+  const d=new Date(s); return isNaN(d)?null:iso(d); }
+function estTotal(ci,co){ let s=0; bookingDatesRange(ci,co).forEach(d=>s+=priceForDate(d)); return s; }
+function importSheetCSV(text){
+  const rows=parseCSV(text).filter(r=>r.length>1 && r.join('').trim());
+  if(rows.length<2)return{added:0,updated:0,skipped:0};
+  const header=rows[0].map(h=>h.trim().toLowerCase());
+  const col=(...names)=>{ for(const n of names){const j=header.indexOf(n);if(j>=0)return j;} return -1; };
+  const iUid=col('uid','id','reservation'),iSrc=col('source','platform'),iGuest=col('guest','name'),
+    iCi=col('checkin','check-in','arrival','from'),iCo=col('checkout','check-out','departure','to'),
+    iG=col('guests','pax'),iTot=col('total','payout','amount','price'),iPh=col('phone'),iEm=col('email'),iN=col('notes');
+  let added=0,updated=0,skipped=0;
+  for(let i=1;i<rows.length;i++){const r=rows[i];const g=j=>j>=0?(r[j]||'').trim():'';
+    const ci=normDate(g(iCi)),co=normDate(g(iCo));
+    if(!ci||!co||co<=ci){skipped++;continue;}
+    let source=(g(iSrc)||'other').toLowerCase(); if(!SOURCES.find(s=>s.id===source))source='other';
+    const uid='gm:'+(g(iUid)||(source+'|'+g(iGuest)+'|'+ci)); // stable key for dedup
+    const existing=db.bookings.find(b=>b.icsUid===uid);
+    const data={source,guest:g(iGuest)||'Guest',checkIn:ci,checkOut:co,
+      guests:Number(g(iG))||1, total:Number((g(iTot)||'').replace(/[^0-9.]/g,''))||estTotal(ci,co),
+      phone:g(iPh),email:g(iEm),notes:g(iN)||'Imported from Gmail',status:'confirmed'};
+    if(existing){ existing.checkIn=ci;existing.checkOut=co;
+      if(!existing.guest||/^reserved/i.test(existing.guest))existing.guest=data.guest;
+      if(g(iPh))existing.phone=data.phone; if(g(iEm))existing.email=data.email; updated++; }
+    else{ data.id='b'+Date.now()+Math.floor(Math.random()*99999); data.icsUid=uid; db.bookings.push(data); added++; }
+  }
+  return {added,updated,skipped};
 }
 async function checkAllFeeds(silent){
-  if(!db.feeds||!db.feeds.length){ if(!silent)toast('No calendar links saved yet'); return; }
+  const has=(db.feeds&&db.feeds.length)||db.gmailSheet;
+  if(!has){ if(!silent)toast('Nothing to check yet — add a calendar link or Gmail sheet'); return; }
   let added=0,updated=0,errors=0;
-  for(const f of db.feeds){
+  for(const f of (db.feeds||[])){
     try{ const text=await fetchICS(f.url); const r=importICS(text,f.source);
       added+=r.added; updated+=r.updated; f.lastChecked=Date.now(); f.lastResult=`${r.added} new, ${r.updated} updated`; }
     catch(e){ errors++; f.lastChecked=Date.now(); f.lastResult='⚠ '+(e.message||e); }
   }
+  if(db.gmailSheet){
+    try{ const text=await fetchText(db.gmailSheet); const r=importSheetCSV(text);
+      added+=r.added; updated+=r.updated; db.gmailLast={t:Date.now(),result:`${r.added} new, ${r.updated} updated`}; }
+    catch(e){ errors++; db.gmailLast={t:Date.now(),result:'⚠ '+(e.message||e)}; }
+  }
   save(); refreshAll();
   if(added>0)toast(`✅ ${added} new booking(s) imported`);
-  else if(!silent)toast(errors?`Checked — ${errors} link(s) had errors`:'No new bookings found');
+  else if(!silent)toast(errors?`Checked — ${errors} source(s) had errors`:'No new bookings found');
 }
 function timeAgo(ts){ if(!ts)return'never'; const s=Math.floor((Date.now()-ts)/1000);
   if(s<60)return'just now'; const m=Math.floor(s/60); if(m<60)return m+'m ago';
@@ -912,9 +963,15 @@ function openSyncModal(){
     <div class="field" style="margin-bottom:8px"><label>Add a calendar link</label>
       <select id="feed_source" style="margin-bottom:8px">${SOURCES.map(s=>`<option value="${s.id}">${s.name}</option>`).join('')}</select>
       <input type="url" id="feed_url" placeholder="https://www.airbnb.com/calendar/ical/12345.ics?s=..."></div>
-    <div style="display:flex;gap:8px;margin-bottom:14px">
+    <div style="display:flex;gap:8px;margin-bottom:16px">
       <button class="btn sm primary" id="addFeedBtn">+ Save link</button>
       <button class="btn sm" id="checkNowBtn">🔄 Check now</button>
+    </div>
+    <div style="border-top:1px solid var(--line);padding-top:14px;margin-bottom:14px">
+      <label style="display:block;font-weight:600;font-size:13px;margin-bottom:6px">📧 Gmail auto-import <span style="color:var(--muted);font-weight:400">— guest name &amp; price</span></label>
+      <input type="url" id="gmailSheetUrl" placeholder="Published Google Sheet CSV link" style="width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:10px;font-size:14px;margin-bottom:8px">
+      <button class="btn sm" id="saveGmailBtn">Save Gmail sheet</button>
+      <p id="gmailStatus" style="color:var(--muted);font-size:12px;margin:8px 0 0">Connects a Google Sheet your Gmail script fills with new bookings. Checked together with <b>Check now</b>. Ask me for the setup steps + script.</p>
     </div>
     <details><summary style="cursor:pointer;font-size:13px;color:var(--muted)">Advanced · privacy · one-time file import</summary>
       <div class="field" style="margin-top:12px"><label>Fetch helper (CORS proxy)</label>
@@ -926,6 +983,13 @@ function openSyncModal(){
   `,[{label:'Done',cls:'btn primary',act:closeModal}]);
   renderFeedList();
   document.getElementById('feed_proxy').value=localStorage.getItem('staymanager_proxy')||'';
+  document.getElementById('gmailSheetUrl').value=db.gmailSheet||'';
+  if(db.gmailLast)document.getElementById('gmailStatus').textContent='Last checked '+timeAgo(db.gmailLast.t)+' · '+db.gmailLast.result;
+  document.getElementById('saveGmailBtn').onclick=()=>{
+    const u=val('gmailSheetUrl').trim();
+    if(u && !/^https?:\/\//i.test(u)){toast('Paste a valid https link to the published sheet');return;}
+    db.gmailSheet=u; save(); toast(u?'Gmail sheet saved — click Check now':'Gmail sheet removed');
+  };
   document.getElementById('addFeedBtn').onclick=()=>{
     const url=val('feed_url').trim();
     if(!/^https?:\/\//i.test(url)){toast('Paste a valid https calendar link');return;}
@@ -999,7 +1063,7 @@ function applyRemote(remote){
   try{
     const d=JSON.parse(remote);
     cloud.applying=true;
-    db=Object.assign({basePrice:75,bookings:[],overrides:{},expenses:[],feeds:[]},d);
+    db=Object.assign({basePrice:75,bookings:[],overrides:{},expenses:[],feeds:[],gmailSheet:''},d);
     if(!Array.isArray(db.expenses))db.expenses=[];
     if(!Array.isArray(db.feeds))db.feeds=[];
     localStorage.setItem(KEY,JSON.stringify(db));
@@ -1135,7 +1199,7 @@ document.getElementById('importFile').onchange=e=>{
 function confirmModalReplace(d){
   modal('Restore backup?',`<p style="color:var(--muted);margin:0">This will replace your current data with the backup
     (${(d.bookings||[]).length} bookings). Make sure you have a backup of current data first.</p>`,[
-    {label:'Restore',cls:'btn primary',act:()=>{db=Object.assign({basePrice:75,bookings:[],overrides:{},expenses:[],feeds:[]},d);if(!Array.isArray(db.expenses))db.expenses=[];if(!Array.isArray(db.feeds))db.feeds=[];save();closeModal();refreshAll();toast('Backup restored');}}
+    {label:'Restore',cls:'btn primary',act:()=>{db=Object.assign({basePrice:75,bookings:[],overrides:{},expenses:[],feeds:[],gmailSheet:''},d);if(!Array.isArray(db.expenses))db.expenses=[];if(!Array.isArray(db.feeds))db.feeds=[];save();closeModal();refreshAll();toast('Backup restored');}}
   ]);
 }
 
@@ -1155,8 +1219,8 @@ show('dashboard');
 updateCloudBtn();
 if(getCfg()){ initCloud().catch(()=>toast('Could not load cloud sync — check your internet')); }
 
-// auto-check saved calendar feeds shortly after load (silent unless new bookings arrive)
-if((db.feeds||[]).length){ setTimeout(()=>checkAllFeeds(true),1500); }
+// auto-check saved calendar feeds + Gmail sheet shortly after load (silent unless new bookings arrive)
+if((db.feeds||[]).length || db.gmailSheet){ setTimeout(()=>checkAllFeeds(true),1500); }
 </script>
 </body>
 </html>
