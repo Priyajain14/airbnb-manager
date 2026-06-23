@@ -29,6 +29,9 @@
     color:var(--muted);font-size:14px}
   nav button:hover{background:var(--bg);color:var(--ink)}
   nav button.active{background:var(--ink);color:#fff}
+  .prop-select{border:1px solid var(--line);background:var(--card);border-radius:10px;padding:8px 12px;
+    font-weight:700;font-size:14px;font-family:inherit;max-width:200px;cursor:pointer}
+  .prop-select:focus{outline:none;border-color:var(--brand)}
   .head-actions{display:flex;gap:8px}
   .btn{border:1px solid var(--line);background:var(--card);padding:9px 16px;border-radius:10px;font-weight:600;font-size:14px}
   .btn:hover{background:var(--bg)}
@@ -213,6 +216,7 @@
     <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C7 2 4 6 4 10c0 4 5 9 7.3 11.4.4.4 1 .4 1.4 0C15 19 20 14 20 10c0-4-3-8-8-8zm0 11a3 3 0 110-6 3 3 0 010 6z"/></svg>
     StayManager
   </div>
+  <select id="propSelect" class="prop-select" title="Choose property"></select>
   <nav id="nav">
     <button data-view="dashboard" class="active">Dashboard</button>
     <button data-view="calendar">Calendar</button>
@@ -392,19 +396,52 @@ const SOURCES=[
 const srcColor=id=>(SOURCES.find(s=>s.id===id)||{}).color||'var(--other)';
 const srcName =id=>(SOURCES.find(s=>s.id===id)||{}).name||'Other';
 const CATEGORIES=['Cleaning','Supplies','Maintenance','Utilities','Platform fees','Taxes','Mortgage/Rent','Insurance','Other'];
-const DEFAULT_PARTNERS=[{id:'p1',name:'Me'},{id:'p2',name:'Partner'}];
+const DEFAULT_PARTNERS=[{id:'p1',name:'Akhilesh Mahajan'},{id:'p2',name:'Priya Jain'}];
 const partnerName=id=>{const p=(db.partners||[]).find(x=>x.id===id);return p?p.name:'Unassigned';};
+// one-time upgrade: replace the old generic "Me"/"Partner" names with the real owners
+// migrate/normalise a saved-data object in place (runs on load and on incoming cloud data)
+function migrateDB(o){
+  if(!o)return;
+  // partners: upgrade generic "Me"/"Partner" to the real owners
+  if(Array.isArray(o.partners)&&o.partners.length===2&&o.partners.some(p=>p.name==='Me')&&o.partners.some(p=>p.name==='Partner')){
+    o.partners.forEach(p=>{ if(p.name==='Me')p.name='Akhilesh Mahajan'; else if(p.name==='Partner')p.name='Priya Jain'; });
+  }
+  if(!Array.isArray(o.partners)||!o.partners.length) o.partners=DEFAULT_PARTNERS.map(p=>({...p}));
+  // properties (multi-listing support)
+  if(!Array.isArray(o.properties)||!o.properties.length) o.properties=[{id:'prop1',name:'My Place'}];
+  const first=o.properties[0].id;
+  if(o.currentProperty!=='all' && !o.properties.find(p=>p.id===o.currentProperty)) o.currentProperty=first;
+  // per-property pricing { propId: {basePrice, overrides} } — migrate legacy flat basePrice/overrides
+  if(!o.pricing||typeof o.pricing!=='object'){
+    o.pricing={}; o.pricing[first]={basePrice:(typeof o.basePrice==='number'?o.basePrice:75),
+      overrides:(o.overrides&&typeof o.overrides==='object')?o.overrides:{}};
+  }
+  o.properties.forEach(p=>{ if(!o.pricing[p.id])o.pricing[p.id]={basePrice:75,overrides:{}}; });
+  // tag every record with a property
+  (o.bookings||[]).forEach(b=>{ if(!b.propertyId)b.propertyId=first; });
+  (o.expenses||[]).forEach(e=>{ if(!e.propertyId)e.propertyId=first; });
+  (o.feeds||[]).forEach(f=>{ if(!f.propertyId)f.propertyId=first; });
+}
 
 let db = load();
 function load(){
   let d={basePrice:75, bookings:[], overrides:{}, expenses:[], feeds:[], gmailSheet:'', partners:DEFAULT_PARTNERS.map(p=>({...p}))};
   try{ const s=JSON.parse(localStorage.getItem(KEY)); if(s) d=Object.assign(d,s); }catch(e){}
-  if(!Array.isArray(d.expenses)) d.expenses=[]; // migrate older saves
+  if(!Array.isArray(d.expenses)) d.expenses=[];
   if(!Array.isArray(d.feeds)) d.feeds=[];
   if(typeof d.gmailSheet!=='string') d.gmailSheet='';
-  if(!Array.isArray(d.partners)||!d.partners.length) d.partners=DEFAULT_PARTNERS.map(p=>({...p}));
-  return d; // feeds:[{id,source,url,...}], gmailSheet: published Google Sheet CSV url filled by the Gmail script
+  migrateDB(d);
+  return d;
 }
+/* ---- property accessors ---- */
+function isAllProps(){ return db.currentProperty==='all'; }
+function firstPropId(){ return (db.properties[0]||{}).id; }
+function propName(id){ const p=(db.properties||[]).find(x=>x.id===id); return p?p.name:'—'; }
+function activePropId(){ return isAllProps()?firstPropId():db.currentProperty; } // a concrete property for calendar/pricing
+function pricingFor(pid){ if(!db.pricing[pid])db.pricing[pid]={basePrice:75,overrides:{}}; return db.pricing[pid]; }
+function curOverrides(){ return pricingFor(activePropId()).overrides; }
+function propBookings(){ return isAllProps()?db.bookings:db.bookings.filter(b=>(b.propertyId||firstPropId())===db.currentProperty); }
+function propExpenses(){ return isAllProps()?db.expenses:db.expenses.filter(e=>(e.propertyId||firstPropId())===db.currentProperty); }
 let cloud={app:null,auth:null,fs:null,_auth:null,_fs:null,uid:null,email:null,
   ready:false,applying:false,firstSnap:false,unsub:null,lastPushed:null,lastSync:null};
 function save(){ localStorage.setItem(KEY,JSON.stringify(db)); cloudOnLocalChange(); }
@@ -421,18 +458,21 @@ const money=n=>'$'+Number(n||0).toLocaleString(undefined,{maximumFractionDigits:
 // nights occupied by a booking = each date from check-in up to (not incl.) check-out
 function bookingDates(b){ const out=[];let d=parseISO(b.checkIn);const end=parseISO(b.checkOut);
   while(d<end){out.push(iso(d));d.setDate(d.getDate()+1);} return out; }
-function priceForDate(isoStr){ const o=db.overrides[isoStr]; return o?Number(o.price):Number(db.basePrice); }
-// a booking's total is always derived live from your current nightly prices (sum of each night)
-function bookingTotal(b){ let s=0; bookingDates(b).forEach(d=>s+=priceForDate(d)); return s; }
+function priceForDate(isoStr,pid){ const pr=pricingFor(pid||activePropId()); const o=pr.overrides[isoStr]; return o?Number(o.price):Number(pr.basePrice); }
+// a booking's total is always derived live from its property's current nightly prices (sum of each night)
+function bookingTotal(b){ let s=0; bookingDates(b).forEach(d=>s+=priceForDate(d,b.propertyId)); return s; }
 const curYM=()=>{const n=new Date();return `${n.getFullYear()}-${pad(n.getMonth()+1)}`;};
 function shiftYM(ym,delta){let[y,m]=ym.split('-').map(Number);m+=delta;while(m<1){m+=12;y--;}while(m>12){m-=12;y++;}return `${y}-${pad(m)}`;}
-function activeBookings(){ return db.bookings.filter(b=>b.status!=='cancelled'); }
-// returns booking occupying a given date (non-cancelled)
+// non-cancelled bookings for the current property (or all properties when 'all' is selected)
+function activeBookings(){ return propBookings().filter(b=>b.status!=='cancelled'); }
+// returns booking occupying a given date (non-cancelled, current property)
 function bookingOn(isoStr){ return activeBookings().find(b=>bookingDates(b).includes(isoStr)); }
 
 /* ============================ Navigation ============================ */
 const views=['dashboard','calendar','bookings','expenses','pricing','report'];
+let currentView='dashboard';
 function show(view){
+  currentView=view;
   views.forEach(v=>document.getElementById('view-'+v).classList.toggle('hidden',v!==view));
   document.querySelectorAll('#nav button').forEach(b=>b.classList.toggle('active',b.dataset.view===view));
   if(view==='dashboard')renderDashboard();
@@ -443,6 +483,50 @@ function show(view){
   if(view==='report')renderReport();
 }
 document.getElementById('nav').addEventListener('click',e=>{ if(e.target.dataset.view)show(e.target.dataset.view); });
+
+/* ============================ Properties ============================ */
+function renderPropSelect(){
+  const sel=document.getElementById('propSelect'); if(!sel)return;
+  const opts=[];
+  if(db.properties.length>1) opts.push(`<option value="all" ${isAllProps()?'selected':''}>🏘 All properties</option>`);
+  db.properties.forEach(p=>opts.push(`<option value="${p.id}" ${db.currentProperty===p.id?'selected':''}>${esc(p.name)}</option>`));
+  opts.push('<option value="__manage">⚙ Manage properties…</option>');
+  sel.innerHTML=opts.join('');
+}
+document.getElementById('propSelect').addEventListener('change',e=>{
+  const v=e.target.value;
+  if(v==='__manage'){ renderPropSelect(); openPropsModal(); return; }
+  db.currentProperty=v; save(); renderPropSelect(); show(currentView);
+});
+function openPropsModal(){
+  const rowsHtml=()=>db.properties.map(p=>`<div style="display:flex;gap:8px;margin-bottom:8px">
+    <input type="text" value="${esc(p.name)}" data-prname="${p.id}" style="flex:1;padding:9px 12px;border:1px solid var(--line);border-radius:10px;font-size:14px">
+    ${db.properties.length>1?`<button class="btn sm danger" data-prremove="${p.id}">Remove</button>`:''}
+  </div>`).join('');
+  const persist=()=>db.properties.forEach(p=>{const i=document.querySelector('[data-prname="'+p.id+'"]');if(i)p.name=i.value.trim()||p.name;});
+  modal('Properties / listings',`
+    <p style="color:var(--muted);font-size:13px;margin:0 0 12px;line-height:1.5">Add each place you rent out. Every property keeps its own calendar, prices, bookings and expenses — switch between them from the top bar.</p>
+    <div id="propRows">${rowsHtml()}</div>
+    <button class="btn sm" id="addPropBtn">+ Add property</button>
+  `,[{label:'Save',cls:'btn primary',act:()=>{persist();save();closeModal();renderPropSelect();refreshAll();toast('Properties saved');}}]);
+  function wire(){
+    document.getElementById('addPropBtn').onclick=()=>{ persist();
+      const id='prop'+Date.now()+Math.floor(Math.random()*999);
+      db.properties.push({id,name:'New property'}); db.pricing[id]={basePrice:75,overrides:{}};
+      document.getElementById('propRows').innerHTML=rowsHtml(); wire(); };
+    document.querySelectorAll('[data-prremove]').forEach(btn=>btn.onclick=()=>{ persist();
+      const rid=btn.dataset.prremove, others=db.properties.filter(p=>p.id!==rid);
+      if(!others.length){toast('Keep at least one property');return;}
+      const fallback=others[0].id;
+      db.bookings.forEach(b=>{if(b.propertyId===rid)b.propertyId=fallback;});
+      db.expenses.forEach(x=>{if(x.propertyId===rid)x.propertyId=fallback;});
+      (db.feeds||[]).forEach(f=>{if(f.propertyId===rid)f.propertyId=fallback;});
+      delete db.pricing[rid]; db.properties=others;
+      if(db.currentProperty===rid)db.currentProperty=fallback;
+      document.getElementById('propRows').innerHTML=rowsHtml(); wire(); });
+  }
+  wire();
+}
 
 /* ============================ Toast ============================ */
 let toastT;
@@ -457,8 +541,8 @@ function renderDashboard(){
   // revenue this month
   const now=new Date(),ym=`${now.getFullYear()}-${pad(now.getMonth()+1)}`;
   let monthRev=0,monthNights=0;
-  act.forEach(b=>bookingDates(b).forEach(d=>{ if(d.startsWith(ym)){monthRev+=priceForDate(d);monthNights++;} }));
-  const monthExp=db.expenses.filter(e=>e.date.startsWith(ym)).reduce((s,e)=>s+Number(e.amount||0),0);
+  act.forEach(b=>bookingDates(b).forEach(d=>{ if(d.startsWith(ym)){monthRev+=priceForDate(d,b.propertyId);monthNights++;} }));
+  const monthExp=propExpenses().filter(e=>e.date.startsWith(ym)).reduce((s,e)=>s+Number(e.amount||0),0);
   const net=monthRev-monthExp;
 
   document.getElementById('statCards').innerHTML=`
@@ -487,6 +571,13 @@ function miniItem(b,showOut){
 /* ============================ Calendar ============================ */
 let calRef=new Date(); calRef.setDate(1);
 function renderCalendar(){
+  if(isAllProps()){
+    document.getElementById('calDow').innerHTML='';
+    document.getElementById('calGrid').innerHTML='<div style="grid-column:1/-1;text-align:center;color:var(--muted);padding:34px">Select a specific property (top-left) to view and edit its calendar.</div>';
+    document.getElementById('monthLabel').textContent='All properties';
+    document.getElementById('monthRevenue').textContent='';
+    return;
+  }
   const dow=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
   document.getElementById('calDow').innerHTML=dow.map(d=>`<div class="dow">${d}</div>`).join('');
   document.getElementById('monthLabel').textContent=
@@ -500,7 +591,7 @@ function renderCalendar(){
   for(let d=1;d<=days;d++){
     const ds=`${y}-${pad(m+1)}-${pad(d)}`;
     const b=bookingOn(ds);
-    const o=db.overrides[ds];
+    const o=curOverrides()[ds];
     const price=priceForDate(ds);
     if(b)monthRev+=price;
     const isToday=ds===todayISO;
@@ -525,28 +616,29 @@ document.getElementById('nextMonth').onclick=()=>{calRef.setMonth(calRef.getMont
 document.getElementById('todayBtn').onclick=()=>{calRef=new Date();calRef.setDate(1);renderCalendar();};
 
 function openDay(ds){
+  const ov=curOverrides(), base=pricingFor(activePropId()).basePrice;
   const b=bookingOn(ds);
-  const o=db.overrides[ds]||{};
+  const o=ov[ds]||{};
   const bookingInfo=b?`<div class="calc-note">Booked by <b>${esc(b.guest||'Guest')}</b> (${srcName(b.source)}) ·
     ${fmtShort(b.checkIn)} → ${fmtShort(b.checkOut)}.
     <a href="#" id="editThisBooking" style="color:var(--brand);font-weight:700">Edit booking</a></div>`:'';
-  modal(`Price for ${fmtDate(ds)}`,`
+  modal(`Price for ${fmtDate(ds)} · ${esc(propName(activePropId()))}`,`
     ${bookingInfo}
     <div class="field">
       <label>Price for this night</label>
-      <input type="number" id="dayPrice" min="0" step="1" value="${o.price!==undefined?o.price:db.basePrice}">
+      <input type="number" id="dayPrice" min="0" step="1" value="${o.price!==undefined?o.price:base}">
     </div>
     <div class="field">
       <label>Note (optional)</label>
       <input type="text" id="dayNote" placeholder="e.g. Weekend, Holiday" value="${esc(o.note||'')}">
     </div>
   `,[
-    o.price!==undefined?{label:'Reset to default',cls:'btn danger',act:()=>{delete db.overrides[ds];save();refreshAll();closeModal();toast('Reset to default price');}}:null,
+    o.price!==undefined?{label:'Reset to default',cls:'btn danger',act:()=>{delete ov[ds];save();refreshAll();closeModal();toast('Reset to default price');}}:null,
     {label:'Save price',cls:'btn primary',act:()=>{
       const p=Number(document.getElementById('dayPrice').value);
       const note=document.getElementById('dayNote').value.trim();
-      if(p===db.basePrice && !note){ delete db.overrides[ds]; }
-      else db.overrides[ds]={price:p,note};
+      if(p===base && !note){ delete ov[ds]; }
+      else ov[ds]={price:p,note};
       save();refreshAll();closeModal();toast('Price saved');
     }},
   ].filter(Boolean));
@@ -562,7 +654,7 @@ function renderBookings(){
   const q=document.getElementById('searchInput').value.toLowerCase();
   const fSrc=document.getElementById('filterSource').value;
   const fStat=document.getElementById('filterStatus').value;
-  let list=db.bookings.slice().sort((a,b)=>b.checkIn.localeCompare(a.checkIn));
+  let list=propBookings().slice().sort((a,b)=>b.checkIn.localeCompare(a.checkIn));
   list=list.filter(b=>{
     if(fSrc&&b.source!==fSrc)return false;
     if(fStat&&b.status!==fStat)return false;
@@ -573,7 +665,7 @@ function renderBookings(){
   const body=document.getElementById('bookingsBody');
   document.getElementById('bookingsEmpty').classList.toggle('hidden',list.length>0);
   body.innerHTML=list.map(b=>`<tr>
-    <td><b>${esc(b.guest||'—')}</b>${b.guests?`<br><small style="color:var(--muted)">${b.guests} guest(s)</small>`:''}</td>
+    <td><b>${esc(b.guest||'—')}</b>${isAllProps()?`<br><small style="color:var(--brand);font-weight:700">${esc(propName(b.propertyId))}</small>`:''}${b.guests?`<br><small style="color:var(--muted)">${b.guests} guest(s)</small>`:''}</td>
     <td><span class="src-tag" style="background:${srcColor(b.source)}">${srcName(b.source)}</span></td>
     <td>${fmtDate(b.checkIn)}</td>
     <td>${fmtDate(b.checkOut)}</td>
@@ -601,8 +693,12 @@ function delBooking(id){
 
 function openBookingForm(id){
   const b=id?db.bookings.find(x=>x.id===id):null;
-  const v=b||{source:'airbnb',status:'confirmed',checkIn:todayISO,checkOut:'',guests:2};
+  const v=b||{source:'airbnb',status:'confirmed',checkIn:todayISO,checkOut:'',guests:2,propertyId:activePropId()};
   modal(b?'Edit booking':'New booking',`
+    ${db.properties.length>1?`<div class="field">
+      <label>Property *</label>
+      <select id="f_property">${db.properties.map(p=>`<option value="${p.id}" ${v.propertyId===p.id?'selected':''}>${esc(p.name)}</option>`).join('')}</select>
+    </div>`:''}
     <div class="field">
       <label>Booking source *</label>
       <select id="f_source">${SOURCES.map(s=>`<option value="${s.id}" ${v.source===s.id?'selected':''}>${s.name}</option>`).join('')}</select>
@@ -653,6 +749,7 @@ function openBookingForm(id){
       source:val('f_source'),guest:val('f_guest').trim(),checkIn:val('f_ci'),checkOut:val('f_co'),
       guests:Number(val('f_guests'))||1,total:Number(val('f_total'))||0,status:val('f_status'),
       phone:val('f_phone').trim(),email:val('f_email').trim(),notes:val('f_notes').trim(),
+      propertyId:document.getElementById('f_property')?val('f_property'):(b?b.propertyId:activePropId()),
     };
     if(!data.guest){toast('Please enter a guest name');return;}
     if(!data.checkIn||!data.checkOut){toast('Please select check-in and check-out');return;}
@@ -666,14 +763,24 @@ function openBookingForm(id){
 function bookingDatesRange(ci,co){const out=[];let d=parseISO(ci);const e=parseISO(co);while(d<e){out.push(iso(d));d.setDate(d.getDate()+1);}return out;}
 function findClash(data,ignoreId){
   if(data.status==='cancelled')return null;
+  const pid=data.propertyId||activePropId();
   const newDates=new Set(bookingDatesRange(data.checkIn,data.checkOut));
-  return activeBookings().find(b=>b.id!==ignoreId && bookingDates(b).some(d=>newDates.has(d)));
+  return db.bookings.find(b=>b.id!==ignoreId && b.status!=='cancelled' && (b.propertyId||firstPropId())===pid && bookingDates(b).some(d=>newDates.has(d)));
 }
 
 /* ============================ Pricing ============================ */
 function renderPricing(){
-  document.getElementById('basePrice').value=db.basePrice;
-  const entries=Object.entries(db.overrides).sort((a,b)=>a[0].localeCompare(b[0]));
+  const bp=document.getElementById('basePrice');
+  if(isAllProps()){
+    bp.value=''; bp.disabled=true;
+    document.getElementById('overrideEmpty').classList.add('hidden');
+    document.getElementById('overrideBody').innerHTML='<tr><td colspan="4" style="color:var(--muted);padding:18px">Select a specific property (top-left) to set its prices.</td></tr>';
+    return;
+  }
+  bp.disabled=false;
+  const pr=pricingFor(activePropId());
+  bp.value=pr.basePrice;
+  const entries=Object.entries(pr.overrides).sort((a,b)=>a[0].localeCompare(b[0]));
   document.getElementById('overrideEmpty').classList.toggle('hidden',entries.length>0);
   document.getElementById('overrideBody').innerHTML=entries.map(([d,o])=>`<tr>
     <td><b>${fmtDate(d)}</b></td>
@@ -684,11 +791,12 @@ function renderPricing(){
       <button class="btn sm danger" data-odel="${d}">Remove</button>
     </td></tr>`).join('');
   document.querySelectorAll('[data-od]').forEach(el=>el.onclick=()=>openDay(el.dataset.od));
-  document.querySelectorAll('[data-odel]').forEach(el=>el.onclick=()=>{delete db.overrides[el.dataset.odel];save();refreshAll();toast('Override removed');});
+  document.querySelectorAll('[data-odel]').forEach(el=>el.onclick=()=>{delete curOverrides()[el.dataset.odel];save();refreshAll();toast('Override removed');});
 }
 document.getElementById('saveBasePrice').onclick=()=>{
+  if(isAllProps()){toast('Pick a specific property first');return;}
   const v=Number(document.getElementById('basePrice').value);
-  if(v>=0){db.basePrice=v;save();toast('Default price saved');refreshAll();}
+  if(v>=0){pricingFor(activePropId()).basePrice=v;save();toast('Default price saved');refreshAll();}
 };
 document.getElementById('addOverrideBtn').onclick=()=>openDay(todayISO);
 
@@ -701,13 +809,14 @@ function renderExpenses(){
   fp.innerHTML='<option value="">Anyone paid</option>'+(db.partners||[]).map(p=>`<option value="${p.id}">${esc(p.name)}</option>`).join('');
   fp.value=curPb;
   const cat=fc.value, mon=document.getElementById('expFilterMonth').value, pb=fp.value;
-  let list=db.expenses.slice().sort((a,b)=>b.date.localeCompare(a.date));
+  const allExp=propExpenses();
+  let list=allExp.slice().sort((a,b)=>b.date.localeCompare(a.date));
   list=list.filter(e=>(!cat||e.category===cat)&&(!mon||e.date.startsWith(mon))&&(!pb||e.paidBy===pb));
 
   const ym=mon||curYM();
-  const monthTotal=db.expenses.filter(e=>e.date.startsWith(ym)).reduce((s,e)=>s+Number(e.amount||0),0);
-  const allTotal=db.expenses.reduce((s,e)=>s+Number(e.amount||0),0);
-  let rev=0;activeBookings().forEach(b=>bookingDates(b).forEach(d=>{if(d.startsWith(ym))rev+=priceForDate(d);}));
+  const monthTotal=allExp.filter(e=>e.date.startsWith(ym)).reduce((s,e)=>s+Number(e.amount||0),0);
+  const allTotal=allExp.reduce((s,e)=>s+Number(e.amount||0),0);
+  let rev=0;activeBookings().forEach(b=>bookingDates(b).forEach(d=>{if(d.startsWith(ym))rev+=priceForDate(d,b.propertyId);}));
   const net=rev-monthTotal;
   document.getElementById('expStats').innerHTML=
     stat(`Expenses (${ym})`,money(monthTotal))+
@@ -719,7 +828,7 @@ function renderExpenses(){
   const body=document.getElementById('expBody');
   document.getElementById('expEmpty').classList.toggle('hidden',list.length>0);
   body.innerHTML=list.map(e=>`<tr>
-    <td>${fmtDate(e.date)}</td>
+    <td>${fmtDate(e.date)}${isAllProps()?`<br><small style="color:var(--brand);font-weight:700">${esc(propName(e.propertyId))}</small>`:''}</td>
     <td><span class="cat-tag">${esc(e.category)}</span></td>
     <td>${e.paidBy?`<span class="who-tag">${esc(partnerName(e.paidBy))}</span>`:'<span style="color:var(--muted)">—</span>'}</td>
     <td style="color:var(--muted)">${esc(e.note||'')}</td>
@@ -793,8 +902,10 @@ function delExpense(id){
 }
 function openExpenseForm(id){
   const e=id?db.expenses.find(x=>x.id===id):null;
-  const v=e||{date:todayISO,category:'Cleaning',amount:'',note:'',paidBy:(db.partners[0]||{}).id};
+  const v=e||{date:todayISO,category:'Cleaning',amount:'',note:'',paidBy:(db.partners[0]||{}).id,propertyId:activePropId()};
   modal(e?'Edit expense':'Add expense',`
+    ${db.properties.length>1?`<div class="field"><label>Property</label>
+      <select id="e_property">${db.properties.map(p=>`<option value="${p.id}" ${v.propertyId===p.id?'selected':''}>${esc(p.name)}</option>`).join('')}</select></div>`:''}
     <div class="row2">
       <div class="field"><label>Date *</label><input type="date" id="e_date" value="${v.date}"></div>
       <div class="field"><label>Amount ($) *</label><input type="number" id="e_amount" min="0" step="0.01" value="${v.amount}"></div>
@@ -808,7 +919,7 @@ function openExpenseForm(id){
     <div class="field"><label>Note</label>
       <input type="text" id="e_note" value="${esc(v.note||'')}" placeholder="e.g. Cleaner for 12 May turnover"></div>
   `,[{label:e?'Save changes':'Add expense',cls:'btn primary',act:()=>{
-    const data={date:val('e_date'),amount:Number(val('e_amount'))||0,category:val('e_cat'),note:val('e_note').trim(),paidBy:val('e_paidby')};
+    const data={date:val('e_date'),amount:Number(val('e_amount'))||0,category:val('e_cat'),note:val('e_note').trim(),paidBy:val('e_paidby'),propertyId:document.getElementById('e_property')?val('e_property'):(e?e.propertyId:activePropId())};
     if(!data.date){toast('Please pick a date');return;}
     if(!data.amount){toast('Please enter an amount');return;}
     if(e)Object.assign(e,data);
@@ -830,13 +941,13 @@ function renderReport(){
   activeBookings().forEach(b=>{
     const dates=bookingDates(b).filter(d=>d.startsWith(ym));
     if(!dates.length)return;
-    let rev=0;dates.forEach(d=>rev+=priceForDate(d));
+    let rev=0;dates.forEach(d=>rev+=priceForDate(d,b.propertyId));
     nightsCount+=dates.length;gross+=rev;
     bySource[b.source]=(bySource[b.source]||0)+rev;
     bRows.push({b,n:dates.length,rev});
   });
   bRows.sort((a,b)=>a.b.checkIn.localeCompare(b.b.checkIn));
-  const exp=db.expenses.filter(e=>e.date.startsWith(ym)).sort((a,b)=>a.date.localeCompare(b.date));
+  const exp=propExpenses().filter(e=>e.date.startsWith(ym)).sort((a,b)=>a.date.localeCompare(b.date));
   const expTotal=exp.reduce((s,e)=>s+Number(e.amount||0),0);
   const net=gross-expTotal;
   const occ=Math.round(nightsCount/daysInMonth*100);
@@ -846,7 +957,7 @@ function renderReport(){
 
   document.getElementById('reportArea').innerHTML=`
     <div class="report-head">
-      <div><div class="biz">StayManager · Airbnb</div><h2>${monthName}</h2></div>
+      <div><div class="biz">StayManager · ${esc(isAllProps()?'All properties':propName(activePropId()))}</div><h2>${monthName}</h2></div>
       <div style="text-align:right;color:var(--muted);font-size:13px">Monthly statement<br>Generated ${fmtDate(todayISO)}</div>
     </div>
     <div class="report-summary">
@@ -912,7 +1023,8 @@ function parseICS(text){
   return events;
 }
 const icsDate=v=>{const m=String(v||'').match(/(\d{4})(\d{2})(\d{2})/);return m?`${m[1]}-${m[2]}-${m[3]}`:null;};
-function importICS(text,source){
+function importICS(text,source,prop){
+  const pid=prop||firstPropId();
   const events=parseICS(text);
   let added=0,updated=0,skipped=0;
   events.forEach(ev=>{
@@ -927,8 +1039,8 @@ function importICS(text,source){
     if(!guest||/^reserved$/i.test(guest)||isBlock||/closed/i.test(guest))guest='Reserved ('+srcName(source)+')';
     const existing=ev.uid?db.bookings.find(b=>b.icsUid===ev.uid):null;
     if(existing){existing.checkIn=ci;existing.checkOut=co;updated++;return;}
-    let tot=0;bookingDatesRange(ci,co).forEach(d=>tot+=priceForDate(d));
-    db.bookings.push({id:'b'+Date.now()+Math.floor(Math.random()*99999),icsUid:ev.uid||'',
+    let tot=0;bookingDatesRange(ci,co).forEach(d=>tot+=priceForDate(d,pid));
+    db.bookings.push({id:'b'+Date.now()+Math.floor(Math.random()*99999),icsUid:ev.uid||'',propertyId:pid,
       source,guest,checkIn:ci,checkOut:co,guests:1,total:tot,status:'confirmed',
       phone:'',email:'',notes:'Imported from '+srcName(source)+' calendar'});
     added++;
@@ -965,24 +1077,27 @@ function parseCSV(text){
 }
 function normDate(s){ s=(s||'').trim(); const m=s.match(/(\d{4})-(\d{2})-(\d{2})/); if(m)return m[0];
   const d=new Date(s); return isNaN(d)?null:iso(d); }
-function estTotal(ci,co){ let s=0; bookingDatesRange(ci,co).forEach(d=>s+=priceForDate(d)); return s; }
-function importSheetCSV(text){
+function estTotal(ci,co,pid){ let s=0; bookingDatesRange(ci,co).forEach(d=>s+=priceForDate(d,pid)); return s; }
+function importSheetCSV(text,prop){
   const rows=parseCSV(text).filter(r=>r.length>1 && r.join('').trim());
   if(rows.length<2)return{added:0,updated:0,skipped:0};
   const header=rows[0].map(h=>h.trim().toLowerCase());
   const col=(...names)=>{ for(const n of names){const j=header.indexOf(n);if(j>=0)return j;} return -1; };
   const iUid=col('uid','id','reservation'),iSrc=col('source','platform'),iGuest=col('guest','name'),
     iCi=col('checkin','check-in','arrival','from'),iCo=col('checkout','check-out','departure','to'),
-    iG=col('guests','pax'),iTot=col('total','payout','amount','price'),iPh=col('phone'),iEm=col('email'),iN=col('notes');
+    iG=col('guests','pax'),iTot=col('total','payout','amount','price'),iPh=col('phone'),iEm=col('email'),iN=col('notes'),
+    iProp=col('property','listing','room');
   let added=0,updated=0,skipped=0;
   for(let i=1;i<rows.length;i++){const r=rows[i];const g=j=>j>=0?(r[j]||'').trim():'';
     const ci=normDate(g(iCi)),co=normDate(g(iCo));
     if(!ci||!co||co<=ci){skipped++;continue;}
     let source=(g(iSrc)||'other').toLowerCase(); if(!SOURCES.find(s=>s.id===source))source='other';
+    let pid=prop||firstPropId();
+    const pv=g(iProp); if(pv){ const mp=db.properties.find(p=>p.name.toLowerCase()===pv.toLowerCase()||p.id===pv); if(mp)pid=mp.id; }
     const uid='gm:'+(g(iUid)||(source+'|'+g(iGuest)+'|'+ci)); // stable key for dedup
     const existing=db.bookings.find(b=>b.icsUid===uid);
-    const data={source,guest:g(iGuest)||'Guest',checkIn:ci,checkOut:co,
-      guests:Number(g(iG))||1, total:Number((g(iTot)||'').replace(/[^0-9.]/g,''))||estTotal(ci,co),
+    const data={source,guest:g(iGuest)||'Guest',checkIn:ci,checkOut:co,propertyId:pid,
+      guests:Number(g(iG))||1, total:Number((g(iTot)||'').replace(/[^0-9.]/g,''))||estTotal(ci,co,pid),
       phone:g(iPh),email:g(iEm),notes:g(iN)||'Imported from Gmail',status:'confirmed'};
     if(existing){ existing.checkIn=ci;existing.checkOut=co;
       if(!existing.guest||/^reserved/i.test(existing.guest))existing.guest=data.guest;
@@ -996,12 +1111,12 @@ async function checkAllFeeds(silent){
   if(!has){ if(!silent)toast('Nothing to check yet — add a calendar link or Gmail sheet'); return; }
   let added=0,updated=0,errors=0;
   for(const f of (db.feeds||[])){
-    try{ const text=await fetchICS(f.url); const r=importICS(text,f.source);
+    try{ const text=await fetchICS(f.url); const r=importICS(text,f.source,f.propertyId);
       added+=r.added; updated+=r.updated; f.lastChecked=Date.now(); f.lastResult=`${r.added} new, ${r.updated} updated`; }
     catch(e){ errors++; f.lastChecked=Date.now(); f.lastResult='⚠ '+(e.message||e); }
   }
   if(db.gmailSheet){
-    try{ const text=await fetchText(db.gmailSheet); const r=importSheetCSV(text);
+    try{ const text=await fetchText(db.gmailSheet); const r=importSheetCSV(text,activePropId());
       added+=r.added; updated+=r.updated; db.gmailLast={t:Date.now(),result:`${r.added} new, ${r.updated} updated`}; }
     catch(e){ errors++; db.gmailLast={t:Date.now(),result:'⚠ '+(e.message||e)}; }
   }
@@ -1018,6 +1133,7 @@ function renderFeedList(){
   if(!db.feeds||!db.feeds.length){ el.innerHTML='<p style="color:var(--muted);font-size:13px;margin:4px 0 12px">No calendar links saved yet. Add one below ⬇</p>'; return; }
   el.innerHTML=db.feeds.map(f=>`<div style="display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--line)">
     <span class="src-tag" style="background:${srcColor(f.source)};flex:0 0 auto">${srcName(f.source)}</span>
+    ${db.properties.length>1?`<span style="flex:0 0 auto;font-size:11px;color:var(--brand);font-weight:700">${esc(propName(f.propertyId))}</span>`:''}
     <span style="flex:1;min-width:0"><small style="display:block;word-break:break-all">${esc(shortUrl(f.url))}</small>
       <small style="color:var(--muted)">${f.lastChecked?('Checked '+timeAgo(f.lastChecked)+' · '+esc(f.lastResult||'')):'Not checked yet'}</small></span>
     <button class="btn sm danger" data-feeddel="${f.id}" style="flex:0 0 auto">Remove</button>
@@ -1031,6 +1147,7 @@ function openSyncModal(){
       The app re-checks your links automatically on open, and on <b>Check now</b>. Calendar links only contain <b>booked dates</b> — no guest name or price.</p>
     <div id="feedList"></div>
     <div class="field" style="margin-bottom:8px"><label>Add a calendar link</label>
+      ${db.properties.length>1?`<select id="feed_property" style="margin-bottom:8px">${db.properties.map(p=>`<option value="${p.id}" ${activePropId()===p.id?'selected':''}>${esc(p.name)}</option>`).join('')}</select>`:''}
       <select id="feed_source" style="margin-bottom:8px">${SOURCES.map(s=>`<option value="${s.id}">${s.name}</option>`).join('')}</select>
       <input type="url" id="feed_url" placeholder="https://www.airbnb.com/calendar/ical/12345.ics?s=..."></div>
     <div style="display:flex;gap:8px;margin-bottom:16px">
@@ -1064,7 +1181,7 @@ function openSyncModal(){
     const url=val('feed_url').trim();
     if(!/^https?:\/\//i.test(url)){toast('Paste a valid https calendar link');return;}
     db.feeds=db.feeds||[];
-    db.feeds.push({id:'f'+Date.now()+Math.floor(Math.random()*9999),source:val('feed_source'),url,lastChecked:0,lastResult:''});
+    db.feeds.push({id:'f'+Date.now()+Math.floor(Math.random()*9999),source:val('feed_source'),url,lastChecked:0,lastResult:'',propertyId:document.getElementById('feed_property')?val('feed_property'):activePropId()});
     save(); document.getElementById('feed_url').value=''; renderFeedList(); toast('Link saved — click Check now');
   };
   document.getElementById('checkNowBtn').onclick=async()=>{
@@ -1076,7 +1193,7 @@ function openSyncModal(){
   const fileEl=document.getElementById('ics_file');
   if(fileEl)fileEl.addEventListener('change',e=>{const f=e.target.files[0];if(!f)return;const r=new FileReader();
     r.onload=()=>{ if(!r.result.includes('BEGIN:VEVENT')){toast('Not a valid .ics file');return;}
-      const res=importICS(r.result,val('feed_source')); toast(`Imported ${res.added} new · ${res.updated} updated`); };
+      const res=importICS(r.result,val('feed_source'),document.getElementById('feed_property')?val('feed_property'):activePropId()); toast(`Imported ${res.added} new · ${res.updated} updated`); };
     r.readAsText(f);});
 }
 document.getElementById('syncBtn').onclick=openSyncModal;
@@ -1142,10 +1259,12 @@ function applyRemote(remote){
   try{
     const d=JSON.parse(remote);
     cloud.applying=true;
+    const keepCur=db.currentProperty; // don't let a remote update change which property this device is viewing
     db=Object.assign({basePrice:75,bookings:[],overrides:{},expenses:[],feeds:[],gmailSheet:'',partners:DEFAULT_PARTNERS.map(p=>({...p}))},d);
     if(!Array.isArray(db.expenses))db.expenses=[];
     if(!Array.isArray(db.feeds))db.feeds=[];
-    if(!Array.isArray(db.partners)||!db.partners.length)db.partners=DEFAULT_PARTNERS.map(p=>({...p}));
+    migrateDB(db);
+    if(keepCur && (keepCur==='all'||db.properties.find(p=>p.id===keepCur))) db.currentProperty=keepCur;
     localStorage.setItem(KEY,JSON.stringify(db));
     cloud.lastPushed=remote;
     refreshAll();
@@ -1284,20 +1403,21 @@ document.getElementById('importFile').onchange=e=>{
 function confirmModalReplace(d){
   modal('Restore backup?',`<p style="color:var(--muted);margin:0">This will replace your current data with the backup
     (${(d.bookings||[]).length} bookings). Make sure you have a backup of current data first.</p>`,[
-    {label:'Restore',cls:'btn primary',act:()=>{db=Object.assign({basePrice:75,bookings:[],overrides:{},expenses:[],feeds:[],gmailSheet:'',partners:DEFAULT_PARTNERS.map(p=>({...p}))},d);if(!Array.isArray(db.expenses))db.expenses=[];if(!Array.isArray(db.feeds))db.feeds=[];if(!Array.isArray(db.partners)||!db.partners.length)db.partners=DEFAULT_PARTNERS.map(p=>({...p}));save();closeModal();refreshAll();toast('Backup restored');}}
+    {label:'Restore',cls:'btn primary',act:()=>{db=Object.assign({basePrice:75,bookings:[],overrides:{},expenses:[],feeds:[],gmailSheet:'',partners:DEFAULT_PARTNERS.map(p=>({...p}))},d);if(!Array.isArray(db.expenses))db.expenses=[];if(!Array.isArray(db.feeds))db.feeds=[];migrateDB(db);save();closeModal();renderPropSelect();refreshAll();toast('Backup restored');}}
   ]);
 }
 
 /* ============================ Utils & init ============================ */
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function val(id){return document.getElementById(id).value;}
-function refreshAll(){renderDashboard();renderCalendar();renderBookings();renderExpenses();renderPricing();renderReport();}
+function refreshAll(){renderPropSelect();renderDashboard();renderCalendar();renderBookings();renderExpenses();renderPricing();renderReport();}
 document.getElementById('newBookingBtn').onclick=()=>openBookingForm();
 document.getElementById('newBookingBtn2').onclick=()=>openBookingForm();
 document.addEventListener('keydown',e=>{if(e.key==='Escape')closeModal();});
 
 // first run seed hint
 if(db.bookings.length===0 && !localStorage.getItem(KEY)){ save(); }
+renderPropSelect();
 show('dashboard');
 
 // restore cloud sync session if previously set up
