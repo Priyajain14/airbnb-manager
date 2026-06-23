@@ -414,6 +414,8 @@ const money=n=>'$'+Number(n||0).toLocaleString(undefined,{maximumFractionDigits:
 function bookingDates(b){ const out=[];let d=parseISO(b.checkIn);const end=parseISO(b.checkOut);
   while(d<end){out.push(iso(d));d.setDate(d.getDate()+1);} return out; }
 function priceForDate(isoStr){ const o=db.overrides[isoStr]; return o?Number(o.price):Number(db.basePrice); }
+// a booking's total is always derived live from your current nightly prices (sum of each night)
+function bookingTotal(b){ let s=0; bookingDates(b).forEach(d=>s+=priceForDate(d)); return s; }
 const curYM=()=>{const n=new Date();return `${n.getFullYear()}-${pad(n.getMonth()+1)}`;};
 function shiftYM(ym,delta){let[y,m]=ym.split('-').map(Number);m+=delta;while(m<1){m+=12;y--;}while(m>12){m-=12;y++;}return `${y}-${pad(m)}`;}
 function activeBookings(){ return db.bookings.filter(b=>b.status!=='cancelled'); }
@@ -531,13 +533,13 @@ function openDay(ds){
       <input type="text" id="dayNote" placeholder="e.g. Weekend, Holiday" value="${esc(o.note||'')}">
     </div>
   `,[
-    o.price!==undefined?{label:'Reset to default',cls:'btn danger',act:()=>{delete db.overrides[ds];save();renderCalendar();closeModal();toast('Reset to default price');}}:null,
+    o.price!==undefined?{label:'Reset to default',cls:'btn danger',act:()=>{delete db.overrides[ds];save();refreshAll();closeModal();toast('Reset to default price');}}:null,
     {label:'Save price',cls:'btn primary',act:()=>{
       const p=Number(document.getElementById('dayPrice').value);
       const note=document.getElementById('dayNote').value.trim();
       if(p===db.basePrice && !note){ delete db.overrides[ds]; }
       else db.overrides[ds]={price:p,note};
-      save();renderCalendar();closeModal();toast('Price saved');
+      save();refreshAll();closeModal();toast('Price saved');
     }},
   ].filter(Boolean));
   if(b){ const link=document.getElementById('editThisBooking');
@@ -569,7 +571,7 @@ function renderBookings(){
     <td>${fmtDate(b.checkOut)}</td>
     <td>${nights(b.checkIn,b.checkOut)}</td>
     <td>${b.guests||'—'}</td>
-    <td>${money(b.total)}</td>
+    <td>${money(bookingTotal(b))}</td>
     <td><span class="status-tag status-${b.status}">${b.status}</span></td>
     <td style="white-space:nowrap;text-align:right">
       <button class="btn sm" data-edit="${b.id}">Edit</button>
@@ -608,7 +610,7 @@ function openBookingForm(id){
     <div class="calc-note" id="calcNote">Select dates to see the nights & suggested price.</div>
     <div class="row3">
       <div class="field"><label>No. of guests</label><input type="number" id="f_guests" min="1" value="${v.guests||1}"></div>
-      <div class="field"><label>Total price ($)</label><input type="number" id="f_total" min="0" value="${v.total!==undefined?v.total:''}"></div>
+      <div class="field"><label>Total (auto from Pricing)</label><input type="number" id="f_total" readonly title="Calculated from your nightly prices — change it on the Pricing tab" style="background:var(--bg);color:var(--muted)" value=""></div>
       <div class="field"><label>Status</label>
         <select id="f_status">
           <option value="confirmed" ${v.status==='confirmed'?'selected':''}>Confirmed</option>
@@ -628,15 +630,13 @@ function openBookingForm(id){
 
   const ci=document.getElementById('f_ci'),co=document.getElementById('f_co'),
         total=document.getElementById('f_total'),note=document.getElementById('calcNote');
-  let totalEdited=!!(b&&b.total!==undefined);
-  total.addEventListener('input',()=>totalEdited=true);
   function recalc(){
     if(ci.value&&co.value&&co.value>ci.value){
       const n=nights(ci.value,co.value);
       let sum=0;bookingDatesRange(ci.value,co.value).forEach(d=>sum+=priceForDate(d));
-      note.innerHTML=`<b>${n}</b> night(s) · suggested total <b>${money(sum)}</b> (based on your nightly prices)`;
-      if(!totalEdited)total.value=sum;
-    } else note.textContent='Select valid dates (check-out must be after check-in).';
+      total.value=sum;
+      note.innerHTML=`<b>${n}</b> night(s) · total <b>${money(sum)}</b>, calculated from your nightly prices. Adjust it on the <b>Pricing</b> tab.`;
+    } else { total.value=''; note.textContent='Select valid dates (check-out must be after check-in).'; }
   }
   ci.addEventListener('change',recalc);co.addEventListener('change',recalc);recalc();
 
@@ -676,7 +676,7 @@ function renderPricing(){
       <button class="btn sm danger" data-odel="${d}">Remove</button>
     </td></tr>`).join('');
   document.querySelectorAll('[data-od]').forEach(el=>el.onclick=()=>openDay(el.dataset.od));
-  document.querySelectorAll('[data-odel]').forEach(el=>el.onclick=()=>{delete db.overrides[el.dataset.odel];save();renderPricing();toast('Override removed');});
+  document.querySelectorAll('[data-odel]').forEach(el=>el.onclick=()=>{delete db.overrides[el.dataset.odel];save();refreshAll();toast('Override removed');});
 }
 document.getElementById('saveBasePrice').onclick=()=>{
   const v=Number(document.getElementById('basePrice').value);
