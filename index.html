@@ -1038,7 +1038,10 @@ async function initCloud(){
   cloud.app=appMod.initializeApp(cfg);
   cloud._auth=authMod; cloud._fs=fsMod;
   cloud.auth=authMod.getAuth(cloud.app);
-  cloud.fs=fsMod.getFirestore(cloud.app);
+  // Connect to the named Firestore database. The standard Firebase DB is "(default)", but this
+  // project's database was created with the id "default", so target that (override via cfg.databaseId).
+  const cfg2=getCfg()||{};
+  cloud.fs=cfg2.databaseId ? fsMod.getFirestore(cloud.app,cfg2.databaseId) : fsMod.getFirestore(cloud.app,'default');
   cloud.ready=true;
   authMod.onAuthStateChanged(cloud.auth,u=>{
     if(u){cloud.uid=u.uid;cloud.email=u.email;subscribeCloud();}
