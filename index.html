@@ -124,6 +124,8 @@
   /* Expense category tags */
   .cat-tag{display:inline-block;padding:3px 10px;border-radius:999px;font-size:12px;font-weight:700;
     background:#eef1ff;color:#3a4ad6}
+  .who-tag{display:inline-block;padding:3px 10px;border-radius:999px;font-size:12px;font-weight:700;
+    background:#e7f6ee;color:#1A8E55}
 
   /* Report */
   .report-head{display:flex;justify-content:space-between;align-items:flex-start;
@@ -337,15 +339,18 @@
     <h1 class="page">Expenses</h1>
     <p class="sub">Track your costs so you can see your real profit.</p>
     <div class="grid stats" id="expStats" style="grid-template-columns:repeat(3,1fr)"></div>
+    <div class="card" id="partnerSplit" style="margin-top:18px"></div>
     <div class="toolbar" style="margin-top:18px">
       <select id="expFilterCat"><option value="">All categories</option></select>
+      <select id="expFilterPaidby"><option value="">Anyone paid</option></select>
       <input type="month" id="expFilterMonth" title="Filter by month">
       <div class="spacer"></div>
+      <button class="btn" id="managePartnersBtn">👥 Partners</button>
       <button class="btn primary" id="addExpenseBtn">+ Add expense</button>
     </div>
     <div class="card" style="padding:0">
       <div class="table-scroll"><table>
-        <thead><tr><th>Date</th><th>Category</th><th>Note</th><th>Amount</th><th></th></tr></thead>
+        <thead><tr><th>Date</th><th>Category</th><th>Paid by</th><th>Note</th><th>Amount</th><th></th></tr></thead>
         <tbody id="expBody"></tbody>
       </table></div>
       <div id="expEmpty" class="empty-state hidden">
@@ -387,14 +392,17 @@ const SOURCES=[
 const srcColor=id=>(SOURCES.find(s=>s.id===id)||{}).color||'var(--other)';
 const srcName =id=>(SOURCES.find(s=>s.id===id)||{}).name||'Other';
 const CATEGORIES=['Cleaning','Supplies','Maintenance','Utilities','Platform fees','Taxes','Mortgage/Rent','Insurance','Other'];
+const DEFAULT_PARTNERS=[{id:'p1',name:'Me'},{id:'p2',name:'Partner'}];
+const partnerName=id=>{const p=(db.partners||[]).find(x=>x.id===id);return p?p.name:'Unassigned';};
 
 let db = load();
 function load(){
-  let d={basePrice:75, bookings:[], overrides:{}, expenses:[], feeds:[], gmailSheet:''};
+  let d={basePrice:75, bookings:[], overrides:{}, expenses:[], feeds:[], gmailSheet:'', partners:DEFAULT_PARTNERS.map(p=>({...p}))};
   try{ const s=JSON.parse(localStorage.getItem(KEY)); if(s) d=Object.assign(d,s); }catch(e){}
   if(!Array.isArray(d.expenses)) d.expenses=[]; // migrate older saves
   if(!Array.isArray(d.feeds)) d.feeds=[];
   if(typeof d.gmailSheet!=='string') d.gmailSheet='';
+  if(!Array.isArray(d.partners)||!d.partners.length) d.partners=DEFAULT_PARTNERS.map(p=>({...p}));
   return d; // feeds:[{id,source,url,...}], gmailSheet: published Google Sheet CSV url filled by the Gmail script
 }
 let cloud={app:null,auth:null,fs:null,_auth:null,_fs:null,uid:null,email:null,
@@ -688,9 +696,13 @@ document.getElementById('addOverrideBtn').onclick=()=>openDay(todayISO);
 function renderExpenses(){
   const fc=document.getElementById('expFilterCat');
   if(fc.options.length<=1)CATEGORIES.forEach(c=>fc.add(new Option(c,c)));
-  const cat=fc.value, mon=document.getElementById('expFilterMonth').value;
+  const fp=document.getElementById('expFilterPaidby');
+  const curPb=fp.value;
+  fp.innerHTML='<option value="">Anyone paid</option>'+(db.partners||[]).map(p=>`<option value="${p.id}">${esc(p.name)}</option>`).join('');
+  fp.value=curPb;
+  const cat=fc.value, mon=document.getElementById('expFilterMonth').value, pb=fp.value;
   let list=db.expenses.slice().sort((a,b)=>b.date.localeCompare(a.date));
-  list=list.filter(e=>(!cat||e.category===cat)&&(!mon||e.date.startsWith(mon)));
+  list=list.filter(e=>(!cat||e.category===cat)&&(!mon||e.date.startsWith(mon))&&(!pb||e.paidBy===pb));
 
   const ym=mon||curYM();
   const monthTotal=db.expenses.filter(e=>e.date.startsWith(ym)).reduce((s,e)=>s+Number(e.amount||0),0);
@@ -702,11 +714,14 @@ function renderExpenses(){
     stat(`Net profit (${ym})`,'<span style="color:'+(net>=0?'var(--ok)':'#c0392b')+'">'+money(net)+'</span>')+
     stat('Expenses all-time',money(allTotal));
 
+  renderPartnerSplit(list, mon);
+
   const body=document.getElementById('expBody');
   document.getElementById('expEmpty').classList.toggle('hidden',list.length>0);
   body.innerHTML=list.map(e=>`<tr>
     <td>${fmtDate(e.date)}</td>
     <td><span class="cat-tag">${esc(e.category)}</span></td>
+    <td>${e.paidBy?`<span class="who-tag">${esc(partnerName(e.paidBy))}</span>`:'<span style="color:var(--muted)">—</span>'}</td>
     <td style="color:var(--muted)">${esc(e.note||'')}</td>
     <td><b>${money(e.amount)}</b></td>
     <td style="text-align:right;white-space:nowrap">
@@ -716,9 +731,60 @@ function renderExpenses(){
   body.querySelectorAll('[data-eedit]').forEach(el=>el.onclick=()=>openExpenseForm(el.dataset.eedit));
   body.querySelectorAll('[data-edel]').forEach(el=>el.onclick=()=>delExpense(el.dataset.edel));
 }
-['expFilterCat','expFilterMonth'].forEach(id=>
+function renderPartnerSplit(list, mon){
+  const el=document.getElementById('partnerSplit'); if(!el)return;
+  const partners=db.partners||[];
+  const totals=partners.map(p=>({p,amt:list.filter(e=>e.paidBy===p.id).reduce((s,e)=>s+Number(e.amount||0),0)}));
+  const unassigned=list.filter(e=>!e.paidBy||!partners.find(p=>p.id===e.paidBy)).reduce((s,e)=>s+Number(e.amount||0),0);
+  const grand=totals.reduce((s,t)=>s+t.amt,0)+unassigned;
+  const scope=mon?('in '+mon):'(all time)';
+  let settle='';
+  if(partners.length===2 && grand>0){
+    const a=totals[0],b=totals[1], diff=Math.abs(a.amt-b.amt)/2;
+    if(diff>=1){ const more=a.amt>=b.amt?a:b, less=a.amt>=b.amt?b:a;
+      settle=`<div style="margin-top:12px;padding:10px 12px;background:var(--bg);border-radius:10px;font-size:14px">
+        ⚖️ To split 50/50, <b>${esc(less.p.name)}</b> owes <b>${esc(more.p.name)}</b> <b>${money(diff)}</b>.</div>`;
+    } else settle=`<div style="margin-top:12px;color:var(--ok);font-size:14px;font-weight:600">✓ All square — you're settled up.</div>`;
+  }
+  el.innerHTML=`<p class="section-title" style="margin-bottom:10px">Who paid what
+      <span style="color:var(--muted);font-weight:400;font-size:13px">${scope}</span></p>
+    <div style="display:flex;gap:10px;flex-wrap:wrap">
+      ${totals.map(t=>`<div style="flex:1;min-width:130px;border:1px solid var(--line);border-radius:10px;padding:12px">
+        <div style="color:var(--muted);font-size:13px">${esc(t.p.name)}</div>
+        <div style="font-size:21px;font-weight:800">${money(t.amt)}</div>
+        <div style="color:var(--muted);font-size:12px">${grand>0?Math.round(t.amt/grand*100):0}% of spend</div></div>`).join('')}
+      ${unassigned>0?`<div style="flex:1;min-width:130px;border:1px dashed var(--line);border-radius:10px;padding:12px">
+        <div style="color:var(--muted);font-size:13px">Unassigned</div>
+        <div style="font-size:21px;font-weight:800">${money(unassigned)}</div>
+        <div style="color:var(--muted);font-size:12px">Edit to set who paid</div></div>`:''}
+    </div>${settle}`;
+}
+['expFilterCat','expFilterMonth','expFilterPaidby'].forEach(id=>
   document.getElementById(id).addEventListener('input',renderExpenses));
 document.getElementById('addExpenseBtn').onclick=()=>openExpenseForm();
+document.getElementById('managePartnersBtn').onclick=openPartnersModal;
+
+function openPartnersModal(){
+  const rowsHtml=()=>(db.partners||[]).map(p=>`<div style="display:flex;gap:8px;margin-bottom:8px">
+    <input type="text" value="${esc(p.name)}" data-pname="${p.id}" style="flex:1;padding:9px 12px;border:1px solid var(--line);border-radius:10px;font-size:14px">
+    ${db.partners.length>1?`<button class="btn sm danger" data-premove="${p.id}">Remove</button>`:''}
+  </div>`).join('');
+  const persistNames=()=>(db.partners||[]).forEach(p=>{const i=document.querySelector('[data-pname="'+p.id+'"]');if(i)p.name=i.value.trim()||p.name;});
+  modal('Partners / owners',`
+    <p style="color:var(--muted);font-size:13px;margin:0 0 12px;line-height:1.5">Name the people sharing this Airbnb. Every expense is tagged with who paid, so you can see each person's contribution and split costs fairly.</p>
+    <div id="partnerRows">${rowsHtml()}</div>
+    <button class="btn sm" id="addPartnerBtn">+ Add person</button>
+  `,[{label:'Save',cls:'btn primary',act:()=>{persistNames();save();closeModal();refreshAll();toast('Partners saved');}}]);
+  function wire(){
+    document.getElementById('addPartnerBtn').onclick=()=>{ persistNames();
+      db.partners.push({id:'p'+Date.now()+Math.floor(Math.random()*9999),name:'New person'});
+      document.getElementById('partnerRows').innerHTML=rowsHtml(); wire(); };
+    document.querySelectorAll('[data-premove]').forEach(btn=>btn.onclick=()=>{ persistNames();
+      db.partners=db.partners.filter(x=>x.id!==btn.dataset.premove);
+      document.getElementById('partnerRows').innerHTML=rowsHtml(); wire(); });
+  }
+  wire();
+}
 
 function delExpense(id){
   const e=db.expenses.find(x=>x.id===id); if(!e)return;
@@ -727,18 +793,22 @@ function delExpense(id){
 }
 function openExpenseForm(id){
   const e=id?db.expenses.find(x=>x.id===id):null;
-  const v=e||{date:todayISO,category:'Cleaning',amount:'',note:''};
+  const v=e||{date:todayISO,category:'Cleaning',amount:'',note:'',paidBy:(db.partners[0]||{}).id};
   modal(e?'Edit expense':'Add expense',`
     <div class="row2">
       <div class="field"><label>Date *</label><input type="date" id="e_date" value="${v.date}"></div>
       <div class="field"><label>Amount ($) *</label><input type="number" id="e_amount" min="0" step="0.01" value="${v.amount}"></div>
     </div>
-    <div class="field"><label>Category</label>
-      <select id="e_cat">${CATEGORIES.map(c=>`<option ${v.category===c?'selected':''}>${c}</option>`).join('')}</select></div>
+    <div class="row2">
+      <div class="field"><label>Category</label>
+        <select id="e_cat">${CATEGORIES.map(c=>`<option ${v.category===c?'selected':''}>${c}</option>`).join('')}</select></div>
+      <div class="field"><label>Paid by</label>
+        <select id="e_paidby">${(db.partners||[]).map(p=>`<option value="${p.id}" ${v.paidBy===p.id?'selected':''}>${esc(p.name)}</option>`).join('')}</select></div>
+    </div>
     <div class="field"><label>Note</label>
       <input type="text" id="e_note" value="${esc(v.note||'')}" placeholder="e.g. Cleaner for 12 May turnover"></div>
   `,[{label:e?'Save changes':'Add expense',cls:'btn primary',act:()=>{
-    const data={date:val('e_date'),amount:Number(val('e_amount'))||0,category:val('e_cat'),note:val('e_note').trim()};
+    const data={date:val('e_date'),amount:Number(val('e_amount'))||0,category:val('e_cat'),note:val('e_note').trim(),paidBy:val('e_paidby')};
     if(!data.date){toast('Please pick a date');return;}
     if(!data.amount){toast('Please enter an amount');return;}
     if(e)Object.assign(e,data);
@@ -1072,9 +1142,10 @@ function applyRemote(remote){
   try{
     const d=JSON.parse(remote);
     cloud.applying=true;
-    db=Object.assign({basePrice:75,bookings:[],overrides:{},expenses:[],feeds:[],gmailSheet:''},d);
+    db=Object.assign({basePrice:75,bookings:[],overrides:{},expenses:[],feeds:[],gmailSheet:'',partners:DEFAULT_PARTNERS.map(p=>({...p}))},d);
     if(!Array.isArray(db.expenses))db.expenses=[];
     if(!Array.isArray(db.feeds))db.feeds=[];
+    if(!Array.isArray(db.partners)||!db.partners.length)db.partners=DEFAULT_PARTNERS.map(p=>({...p}));
     localStorage.setItem(KEY,JSON.stringify(db));
     cloud.lastPushed=remote;
     refreshAll();
@@ -1213,7 +1284,7 @@ document.getElementById('importFile').onchange=e=>{
 function confirmModalReplace(d){
   modal('Restore backup?',`<p style="color:var(--muted);margin:0">This will replace your current data with the backup
     (${(d.bookings||[]).length} bookings). Make sure you have a backup of current data first.</p>`,[
-    {label:'Restore',cls:'btn primary',act:()=>{db=Object.assign({basePrice:75,bookings:[],overrides:{},expenses:[],feeds:[],gmailSheet:''},d);if(!Array.isArray(db.expenses))db.expenses=[];if(!Array.isArray(db.feeds))db.feeds=[];save();closeModal();refreshAll();toast('Backup restored');}}
+    {label:'Restore',cls:'btn primary',act:()=>{db=Object.assign({basePrice:75,bookings:[],overrides:{},expenses:[],feeds:[],gmailSheet:'',partners:DEFAULT_PARTNERS.map(p=>({...p}))},d);if(!Array.isArray(db.expenses))db.expenses=[];if(!Array.isArray(db.feeds))db.feeds=[];if(!Array.isArray(db.partners)||!db.partners.length)db.partners=DEFAULT_PARTNERS.map(p=>({...p}));save();closeModal();refreshAll();toast('Backup restored');}}
   ]);
 }
 
