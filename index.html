@@ -1063,7 +1063,7 @@ function subscribeCloud(){
       if(remote===cloud.lastPushed)return; // ignore our own echo
       applyRemote(remote); toast('Updated from another device');
     }
-  },err=>toast('Sync error: '+(err.code||err.message)));
+  },err=>{cloud.lastError=(err.code||err.message);updateCloudBtn();toast('Sync error: '+(err.code||err.message));});
 }
 function applyRemote(remote){
   try{
@@ -1091,14 +1091,15 @@ function pushCloud(){
   if(!cloud.uid||!cloud.fs)return;
   const json=JSON.stringify(db); cloud.lastPushed=json;
   cloud._fs.setDoc(cloud._fs.doc(cloud.fs,'stays',cloud.uid),{data:json,updatedAt:Date.now()})
-    .then(()=>{cloud.lastSync=Date.now();updateCloudBtn();})
-    .catch(e=>toast('Sync error: '+(e.code||e.message)));
+    .then(()=>{cloud.lastSync=Date.now();cloud.lastError=null;updateCloudBtn();})
+    .catch(e=>{cloud.lastError=(e.code||e.message);updateCloudBtn();toast('Sync error: '+(e.code||e.message));});
 }
 let cloudT;
 function cloudOnLocalChange(){ if(!cloud.uid||cloud.applying)return; clearTimeout(cloudT); cloudT=setTimeout(pushCloud,700); }
 function updateCloudBtn(){
   const b=document.getElementById('cloudBtn'); if(!b)return;
-  if(cloud.uid){b.textContent='☁ Synced'; b.style.color='var(--ok)'; b.style.borderColor='#bce8d0';}
+  if(cloud.uid&&cloud.lastError){b.textContent='⚠ Sync error'; b.style.color='#c0392b'; b.style.borderColor='#f3c6c1';}
+  else if(cloud.uid){b.textContent='☁ Synced'; b.style.color='var(--ok)'; b.style.borderColor='#bce8d0';}
   else if(getCfg()){b.textContent='☁ Sign in'; b.style.color=''; b.style.borderColor='';}
   else{b.textContent='☁ Sync'; b.style.color=''; b.style.borderColor='';}
 }
@@ -1152,14 +1153,18 @@ function cloudAuthStep(){
   }
 }
 function cloudStatusStep(){
+  const permissue=cloud.lastError&&/permission|insufficient|denied/i.test(cloud.lastError);
+  const status = cloud.lastError
+    ? `<div class="calc-note" style="background:#fdeceb;color:#c0392b">⚠ <b>Sync problem:</b> ${esc(cloud.lastError)}${permissue?'<br><br>This means your Firestore <b>Rules</b> are blocking access. Open Firebase → Firestore → <b>Rules</b>, paste the rule I gave you, and click <b>Publish</b>.':''}</div>`
+    : `<div class="calc-note">✅ Synced as <b>${esc(cloud.email)}</b>. Last upload: <b>${cloud.lastSync?timeAgo(cloud.lastSync):'pending…'}</b>. Shared live across devices.</div>`;
   modal('Cloud sync',
-   `<div class="calc-note">✅ Synced as <b>${esc(cloud.email)}</b>. Your data is backed up and shared across devices in real time.</div>
-    <p style="color:var(--muted);font-size:13px;line-height:1.55">
-      <b>To use it on your phone:</b> open this same web address on your phone, tap <b>☁ Sync</b>,
-      paste the setup code below (so you don’t retype the config), then sign in with the same email & password.</p>
+   status +
+   `<p style="color:var(--muted);font-size:13px;line-height:1.55">
+      <b>Phone:</b> open this same web address, tap <b>☁ Sync</b>, paste the setup code below, then sign in with the <b>same email &amp; password</b> (<b>${esc(cloud.email||'')}</b>).</p>
     <div class="field"><label>Phone setup code</label>
       <textarea id="setupCode" rows="3" readonly style="font-family:monospace;font-size:12px"></textarea></div>`,
-   [{label:'📋 Copy code',cls:'btn',act:()=>{const t=document.getElementById('setupCode');t.select();
+   [{label:'🔄 Test sync now',cls:'btn',act:()=>{cloud.lastPushed=null;pushCloud();setTimeout(()=>{closeModal();openCloudModal();},800);}},
+    {label:'📋 Copy code',cls:'btn',act:()=>{const t=document.getElementById('setupCode');t.select();
        navigator.clipboard&&navigator.clipboard.writeText(t.value);toast('Setup code copied');}},
     {label:'Sign out',cls:'btn danger',act:()=>{cloud._auth.signOut(cloud.auth).then(()=>{closeModal();toast('Signed out (data stays on this device)');});}}]);
   try{document.getElementById('setupCode').value=btoa(JSON.stringify(getCfg()));}catch(e){}
