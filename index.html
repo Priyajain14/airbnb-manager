@@ -20,7 +20,30 @@
     --airbnb:#FF5A5F; --booking:#003580; --vrbo:#1E4E8C; --direct:#1A9E5F; --other:#717171;
     --shadow:0 1px 3px rgba(0,0,0,.08),0 6px 18px rgba(0,0,0,.06);
     --radius:14px;
+    color-scheme:light;
   }
+  /* Dark mode — redefine the palette + fix the few hardcoded light colours */
+  html[data-theme="dark"]{
+    --brand:#FF6B70; --brand-dark:#FF5A5F; --ink:#E8E9EC; --muted:#9AA0A6;
+    --line:#2C2F35; --bg:#0F1115; --card:#1A1D22; --ok:#37D07F; --warn:#E0A800;
+    --shadow:0 1px 3px rgba(0,0,0,.5),0 6px 18px rgba(0,0,0,.55);
+    color-scheme:dark;
+  }
+  html[data-theme="dark"] nav button:hover{background:rgba(255,255,255,.07)}
+  html[data-theme="dark"] nav button.active{background:var(--brand);color:#fff}
+  html[data-theme="dark"] .btn:hover{background:rgba(255,255,255,.06)}
+  html[data-theme="dark"] .btn.danger{color:#ff7a7a;border-color:#5a2b2b}
+  html[data-theme="dark"] .btn.danger:hover{background:#3a1f1f}
+  html[data-theme="dark"] .day.booked-bg{background:#2a1517}
+  html[data-theme="dark"] .day.today{border-color:var(--brand)}
+  html[data-theme="dark"] .status-confirmed{background:rgba(55,208,127,.16);color:#5cd99a}
+  html[data-theme="dark"] .status-pending{background:rgba(224,168,0,.16);color:#e8b73a}
+  html[data-theme="dark"] .status-cancelled{background:rgba(255,255,255,.08);color:#8b9096}
+  html[data-theme="dark"] .cat-tag{background:rgba(110,126,255,.2);color:#b3bcff}
+  html[data-theme="dark"] .who-tag{background:rgba(55,208,127,.16);color:#6fe0a6}
+  html[data-theme="dark"] #toast{background:#2b2f36;color:#fff}
+  /* form controls follow the theme surface in both modes */
+  .field input,.field select,.field textarea,.toolbar input,.toolbar select{background:var(--card);color:var(--ink)}
   *{box-sizing:border-box}
   body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
     background:var(--bg);color:var(--ink);font-size:15px;line-height:1.45;overflow-x:hidden}
@@ -209,15 +232,23 @@
 
   /* Print */
   @media print{
+    /* always print on a light palette, even if the app is in dark mode */
+    html[data-theme="dark"]{--ink:#111;--muted:#555;--bg:#fff;--card:#fff;--line:#ddd;--brand:#c0392b;color-scheme:light}
     header,.no-print{display:none!important}
     main{padding:0;max-width:100%}
     .card{box-shadow:none;border:none;padding:0}
-    body{background:#fff;font-size:12px}
+    body{background:#fff;color:#111;font-size:12px}
     .report-summary{break-inside:avoid}
     table{break-inside:auto} tr{break-inside:avoid}
     @page{margin:14mm}
   }
 </style>
+<script>
+  // Apply the saved theme (or follow the device) immediately so there's no light-mode flash.
+  (function(){try{var t=localStorage.getItem('staymanager_theme');
+    if(t!=='light'&&t!=='dark')t=matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';
+    document.documentElement.setAttribute('data-theme',t);}catch(e){}})();
+</script>
 </head>
 <body>
 <header>
@@ -235,6 +266,7 @@
     <button data-view="report">Report</button>
   </nav>
   <div class="head-actions">
+    <button class="btn sm" id="themeBtn" title="Switch between light and dark mode">🌙 Dark</button>
     <button class="btn sm" id="cloudBtn" title="Sync your data across devices (phone + computer)">☁ Sync</button>
     <button class="btn sm" id="syncBtn" title="Import bookings from an Airbnb / Booking.com calendar (.ics)">📅 Sync .ics</button>
     <button class="btn sm" id="exportBtn" title="Download a backup of all your data">⬇ Backup</button>
@@ -1429,6 +1461,22 @@ function cloudStatusStep(){
   try{document.getElementById('setupCode').value=btoa(JSON.stringify(getCfg()));}catch(e){}
 }
 document.getElementById('cloudBtn').onclick=openCloudModal;
+
+/* ============================ Dark mode ============================ */
+const THEMEKEY='staymanager_theme';
+function currentTheme(){ return document.documentElement.getAttribute('data-theme')==='dark'?'dark':'light'; }
+function setThemeLabel(){
+  const t=currentTheme();
+  const b=document.getElementById('themeBtn'); if(b)b.textContent=t==='dark'?'☀ Light':'🌙 Dark';
+  const m=document.querySelector('meta[name="theme-color"]'); if(m)m.setAttribute('content',t==='dark'?'#1A1D22':'#FF5A5F');
+}
+document.getElementById('themeBtn').onclick=()=>{
+  const t=currentTheme()==='dark'?'light':'dark';
+  document.documentElement.setAttribute('data-theme',t);
+  localStorage.setItem(THEMEKEY,t);
+  setThemeLabel();
+};
+setThemeLabel(); // match the button + status-bar colour to the theme applied in <head>
 
 /* ============================ Modal helpers ============================ */
 function modal(title,bodyHtml,buttons){
