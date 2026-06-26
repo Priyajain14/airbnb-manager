@@ -454,7 +454,7 @@ const todayISO=iso(new Date());
 function nights(ci,co){ return Math.max(0,Math.round((parseISO(co)-parseISO(ci))/86400000)); }
 function fmtDate(s){ if(!s)return''; return parseISO(s).toLocaleDateString(undefined,{day:'numeric',month:'short',year:'numeric'}); }
 function fmtShort(s){ return parseISO(s).toLocaleDateString(undefined,{day:'numeric',month:'short'}); }
-const money=n=>'$'+Number(n||0).toLocaleString(undefined,{maximumFractionDigits:0});
+const money=n=>'₹'+Number(n||0).toLocaleString('en-IN',{maximumFractionDigits:0});
 // nights occupied by a booking = each date from check-in up to (not incl.) check-out
 function bookingDates(b){ const out=[];let d=parseISO(b.checkIn);const end=parseISO(b.checkOut);
   while(d<end){out.push(iso(d));d.setDate(d.getDate()+1);} return out; }
@@ -908,7 +908,7 @@ function openExpenseForm(id){
       <select id="e_property">${db.properties.map(p=>`<option value="${p.id}" ${v.propertyId===p.id?'selected':''}>${esc(p.name)}</option>`).join('')}</select></div>`:''}
     <div class="row2">
       <div class="field"><label>Date *</label><input type="date" id="e_date" value="${v.date}"></div>
-      <div class="field"><label>Amount ($) *</label><input type="number" id="e_amount" min="0" step="0.01" value="${v.amount}"></div>
+      <div class="field"><label>Amount (₹) *</label><input type="number" id="e_amount" min="0" step="0.01" value="${v.amount}"></div>
     </div>
     <div class="row2">
       <div class="field"><label>Category</label>
