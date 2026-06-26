@@ -1221,7 +1221,21 @@ document.getElementById('syncBtn').onclick=openSyncModal;
 const CFGKEY='staymanager_fbcfg';
 const FB='https://www.gstatic.com/firebasejs/10.12.0/';
 function getCfg(){try{return JSON.parse(localStorage.getItem(CFGKEY));}catch(e){return null;}}
-function saveCfg(o){localStorage.setItem(CFGKEY,JSON.stringify(o));}
+// a random, hard-to-guess id that identifies one shared household dataset
+function newHouseholdId(){
+  try{ if(window.crypto&&crypto.randomUUID) return 'h_'+crypto.randomUUID().replace(/-/g,''); }catch(e){}
+  return 'h_'+Math.random().toString(36).slice(2)+Math.random().toString(36).slice(2)+Math.random().toString(36).slice(2);
+}
+function saveCfg(o){ if(o&&!o.householdId)o.householdId=newHouseholdId(); localStorage.setItem(CFGKEY,JSON.stringify(o));}
+// The document this device reads/writes. With a household id (the default now) several
+// accounts that share the same id all see one dataset; without it we fall back to the
+// legacy per-user document so older setups keep working.
+function cloudDoc(){
+  const cfg=getCfg()||{};
+  return cfg.householdId
+    ? cloud._fs.doc(cloud.fs,'households',cfg.householdId)
+    : cloud._fs.doc(cloud.fs,'stays',cloud.uid);
+}
 function parseCfg(text){
   let t=(text||'').trim();
   if(t && t[0]!=='{' && t.indexOf('apiKey')<0){ try{t=atob(t);}catch(e){} } // maybe a "phone setup code"
@@ -1239,6 +1253,7 @@ function parseCfg(text){
 async function initCloud(){
   if(cloud.app){cloud.ready=true;return;}
   const cfg=getCfg(); if(!cfg)return;
+  if(!cfg.householdId)saveCfg(cfg); // upgrade an older setup to shared-household mode
   const [appMod,authMod,fsMod]=await Promise.all([
     import(FB+'firebase-app.js'), import(FB+'firebase-auth.js'), import(FB+'firebase-firestore.js')]);
   cloud.app=appMod.initializeApp(cfg);
@@ -1267,11 +1282,11 @@ function syncSig(o){ const c=Object.assign({},o); delete c.currentProperty; retu
 function subscribeCloud(){
   if(cloud.unsub)cloud.unsub();
   cloud.firstSnap=true;
-  const ref=cloud._fs.doc(cloud.fs,'stays',cloud.uid);
+  const ref=cloudDoc();
   cloud.unsub=cloud._fs.onSnapshot(ref,snap=>{
     if(cloud.firstSnap){
       cloud.firstSnap=false;
-      if(!snap.exists()){ cloud.lastPushed=null; pushCloud(); toast('Cloud sync on — data backed up'); return; }
+      if(!snap.exists()){ seedHousehold(); return; }
       const remote=snap.data().data;
       // only ask which copy to keep when this device has data AND it genuinely differs from the cloud
       let conflict=false;
@@ -1287,6 +1302,19 @@ function subscribeCloud(){
       applyRemote(remote); toast('Updated from another device');
     }
   },err=>{cloud.lastError=(err.code||err.message);updateCloudBtn();toast('Sync error: '+(err.code||err.message));});
+}
+// First time a shared household document is opened it doesn't exist yet. Fill it from this
+// device's data; if this device is empty, bring over anything this account previously saved
+// under its own personal (legacy) document so existing data isn't stranded.
+function seedHousehold(){
+  if(db.bookings.length||db.expenses.length){ cloud.lastPushed=null; pushCloud(); toast('Shared sync on — your data is now shared'); return; }
+  const backup=()=>{ cloud.lastPushed=null; pushCloud(); toast('Shared sync on — data backed up'); };
+  const cfg=getCfg()||{};
+  if(!cfg.householdId){ backup(); return; }
+  cloud._fs.getDoc(cloud._fs.doc(cloud.fs,'stays',cloud.uid)).then(old=>{
+    if(old.exists()&&old.data()&&old.data().data){ applyRemote(old.data().data); pushCloud(); toast('Moved your existing data into shared sync'); }
+    else backup();
+  }).catch(backup);
 }
 function applyRemote(remote){
   try{
@@ -1323,7 +1351,7 @@ function reconcile(remote){
 function pushCloud(){
   if(!cloud.uid||!cloud.fs)return;
   const json=JSON.stringify(db); cloud.lastPushed=json;
-  cloud._fs.setDoc(cloud._fs.doc(cloud.fs,'stays',cloud.uid),{data:json,updatedAt:Date.now()})
+  cloud._fs.setDoc(cloudDoc(),{data:json,updatedAt:Date.now()})
     .then(()=>{cloud.lastSync=Date.now();cloud.lastError=null;updateCloudBtn();})
     .catch(e=>{cloud.lastError=(e.code||e.message);updateCloudBtn();toast('Sync error: '+(e.code||e.message));});
 }
@@ -1371,8 +1399,9 @@ function cloudConfigStep(){
 function cloudAuthStep(){
   modal('Cloud sync — step 2: sign in',
    `<p style="color:var(--muted);font-size:13px;margin:0 0 12px;line-height:1.5">
-      Use the <b>same email & password on every device</b> to share your data.
-      First time on any device? Tap <b>Create account</b>.</p>
+      Sign in with <b>your own email &amp; password</b> (or the same one on every device).
+      Everyone who pastes <b>your setup code</b> shares the same household data — even with their own login.
+      First time on this device? Tap <b>Create account</b>.</p>
     <div class="field"><label>Email</label><input type="email" id="cl_email" placeholder="you@example.com"></div>
     <div class="field"><label>Password</label><input type="password" id="cl_pass" placeholder="at least 6 characters"></div>`,
    [{label:'Create account',cls:'btn',act:()=>doAuth(true)},
@@ -1389,11 +1418,12 @@ function cloudStatusStep(){
   const permissue=cloud.lastError&&/permission|insufficient|denied/i.test(cloud.lastError);
   const status = cloud.lastError
     ? `<div class="calc-note" style="background:#fdeceb;color:#c0392b">⚠ <b>Sync problem:</b> ${esc(cloud.lastError)}${permissue?'<br><br>This means your Firestore <b>Rules</b> are blocking access. Open Firebase → Firestore → <b>Rules</b>, paste the rule I gave you, and click <b>Publish</b>.':''}</div>`
-    : `<div class="calc-note">✅ Synced as <b>${esc(cloud.email)}</b>. Last upload: <b>${cloud.lastSync?timeAgo(cloud.lastSync):'pending…'}</b>. Shared live across devices.</div>`;
+    : `<div class="calc-note">✅ Synced as <b>${esc(cloud.email)}</b>. Last upload: <b>${cloud.lastSync?timeAgo(cloud.lastSync):'pending…'}</b>. Shared live across everyone in your household.</div>`;
   modal('Cloud sync',
    status +
    `<p style="color:var(--muted);font-size:13px;line-height:1.55">
-      <b>Phone:</b> open this same web address, tap <b>☁ Sync</b>, paste the setup code below, then sign in with the <b>same email &amp; password</b> (<b>${esc(cloud.email||'')}</b>).</p>
+      <b>Add another phone or your partner:</b> open this same web address, tap <b>☁ Sync</b>, paste the setup code below, then sign in.
+      Your partner can use <b>their own email &amp; password</b> — pasting this code puts them in the same shared household, so you both see the same data.</p>
     <div class="field"><label>Phone setup code</label>
       <textarea id="setupCode" rows="3" readonly style="font-family:monospace;font-size:12px"></textarea></div>`,
    [{label:'🔄 Test sync now',cls:'btn',act:()=>{cloud.lastPushed=null;pushCloud();setTimeout(()=>{closeModal();openCloudModal();},800);}},
