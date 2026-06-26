@@ -2,8 +2,17 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>StayManager — Airbnb Booking Manager</title>
+<!-- PWA / installable app -->
+<meta name="theme-color" content="#FF5A5F">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="StayManager">
 <style>
   :root{
     --brand:#FF5A5F; --brand-dark:#E04A4F; --ink:#222; --muted:#717171;
@@ -1246,6 +1255,15 @@ async function initCloud(){
     updateCloudBtn();
   });
 }
+// stable, key-order-independent JSON used to compare cloud vs local data
+function stableStr(o){
+  if(o===null||typeof o!=='object')return JSON.stringify(o);
+  if(Array.isArray(o))return '['+o.map(stableStr).join(',')+']';
+  return '{'+Object.keys(o).sort().map(k=>JSON.stringify(k)+':'+stableStr(o[k])).join(',')+'}';
+}
+// signature of the *meaningful* data, ignoring device-local view state so we don't
+// nag with a "which data to keep?" prompt over differences that aren't real conflicts
+function syncSig(o){ const c=Object.assign({},o); delete c.currentProperty; return stableStr(c); }
 function subscribeCloud(){
   if(cloud.unsub)cloud.unsub();
   cloud.firstSnap=true;
@@ -1255,7 +1273,12 @@ function subscribeCloud(){
       cloud.firstSnap=false;
       if(!snap.exists()){ cloud.lastPushed=null; pushCloud(); toast('Cloud sync on — data backed up'); return; }
       const remote=snap.data().data;
-      if((db.bookings.length||db.expenses.length) && remote!==JSON.stringify(db)){ reconcile(remote); return; }
+      // only ask which copy to keep when this device has data AND it genuinely differs from the cloud
+      let conflict=false;
+      if(db.bookings.length||db.expenses.length){
+        try{ conflict = syncSig(JSON.parse(remote))!==syncSig(db); }catch(e){ conflict=true; }
+      }
+      if(conflict){ reconcile(remote); return; }
       applyRemote(remote);
     }else{
       if(!snap.exists())return;
@@ -1277,8 +1300,15 @@ function applyRemote(remote){
     if(keepCur && (keepCur==='all'||db.properties.find(p=>p.id===keepCur))) db.currentProperty=keepCur;
     localStorage.setItem(KEY,JSON.stringify(db));
     cloud.lastPushed=remote;
+    cloud.lastError=null;
     refreshAll();
-  }catch(e){}
+  }catch(e){
+    // surface the failure instead of silently dropping the cloud data
+    cloud.applying=false;
+    cloud.lastError='Could not read cloud data: '+(e&&e.message||e);
+    console.error('applyRemote failed',e);
+    toast('⚠ '+cloud.lastError);
+  }
   cloud.applying=false; updateCloudBtn();
 }
 function reconcile(remote){
@@ -1466,6 +1496,9 @@ if(getCfg()){ initCloud().catch(()=>toast('Could not load cloud sync — check y
 
 // auto-check saved calendar feeds + Gmail sheet shortly after load (silent unless new bookings arrive)
 if((db.feeds||[]).length || db.gmailSheet){ setTimeout(()=>checkAllFeeds(true),1500); }
+
+// register the service worker so the app installs to the home screen and works offline
+if('serviceWorker' in navigator){ window.addEventListener('load',()=>navigator.serviceWorker.register('sw.js').catch(()=>{})); }
 </script>
 </body>
 </html>
