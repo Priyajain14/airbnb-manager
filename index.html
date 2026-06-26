@@ -142,6 +142,15 @@
   .calc-note{background:var(--bg);border-radius:10px;padding:10px 12px;font-size:13px;color:var(--muted);margin-bottom:14px}
   .calc-note b{color:var(--ink)}
 
+  /* Global search results */
+  .search-row{display:flex;align-items:center;gap:8px;padding:10px 8px;border-bottom:1px solid var(--line);
+    cursor:pointer;border-radius:8px;font-size:14px}
+  .search-row:hover{background:var(--bg)}
+  .search-row:last-child{border-bottom:none}
+  .kbd{display:inline-block;min-width:18px;text-align:center;padding:2px 6px;border:1px solid var(--line);
+    border-bottom-width:2px;border-radius:6px;font-size:12px;font-family:ui-monospace,Menlo,Consolas,monospace;
+    background:var(--bg);color:var(--ink);font-weight:700}
+
   /* Toast */
   #toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(120px);
     background:var(--ink);color:#fff;padding:12px 22px;border-radius:12px;font-weight:600;
@@ -266,6 +275,7 @@
     <button data-view="report">Report</button>
   </nav>
   <div class="head-actions">
+    <button class="btn sm" id="searchBtn" title="Search everything (press /)">🔍 Search</button>
     <button class="btn sm" id="themeBtn" title="Switch between light and dark mode">🌙 Dark</button>
     <button class="btn sm" id="cloudBtn" title="Sync your data across devices (phone + computer)">☁ Sync</button>
     <button class="btn sm" id="syncBtn" title="Import bookings from an Airbnb / Booking.com calendar (.ics)">📅 Sync .ics</button>
@@ -504,6 +514,11 @@ function bookingDates(b){ const out=[];let d=parseISO(b.checkIn);const end=parse
 function priceForDate(isoStr,pid){ const pr=pricingFor(pid||activePropId()); const o=pr.overrides[isoStr]; return o?Number(o.price):Number(pr.basePrice); }
 // a booking's total is always derived live from its property's current nightly prices (sum of each night)
 function bookingTotal(b){ let s=0; bookingDates(b).forEach(d=>s+=priceForDate(d,b.propertyId)); return s; }
+// revenue-affecting add-ons (cleaning fee + extra-guest charge). The security deposit is NOT
+// counted as income — it's money held and usually returned to the guest.
+function bookingExtras(b){ return Number(b.cleaningFee||0)+Number(b.extraCharge||0); }
+// what the guest actually pays for the stay (nights + add-ons), excluding any refundable deposit
+function bookingGrandTotal(b){ return bookingTotal(b)+bookingExtras(b); }
 const curYM=()=>{const n=new Date();return `${n.getFullYear()}-${pad(n.getMonth()+1)}`;};
 function shiftYM(ym,delta){let[y,m]=ym.split('-').map(Number);m+=delta;while(m<1){m+=12;y--;}while(m>12){m-=12;y++;}return `${y}-${pad(m)}`;}
 // non-cancelled bookings for the current property (or all properties when 'all' is selected)
@@ -584,7 +599,10 @@ function renderDashboard(){
   // revenue this month
   const now=new Date(),ym=`${now.getFullYear()}-${pad(now.getMonth()+1)}`;
   let monthRev=0,monthNights=0;
-  act.forEach(b=>bookingDates(b).forEach(d=>{ if(d.startsWith(ym)){monthRev+=priceForDate(d,b.propertyId);monthNights++;} }));
+  act.forEach(b=>{
+    bookingDates(b).forEach(d=>{ if(d.startsWith(ym)){monthRev+=priceForDate(d,b.propertyId);monthNights++;} });
+    if((b.checkIn||'').startsWith(ym))monthRev+=bookingExtras(b); // cleaning/extra-guest fees count in the check-in month
+  });
   const monthExp=propExpenses().filter(e=>e.date.startsWith(ym)).reduce((s,e)=>s+Number(e.amount||0),0);
   const net=monthRev-monthExp;
 
@@ -716,15 +734,17 @@ function renderBookings(){
     <td>${fmtDate(b.checkOut)}</td>
     <td>${nights(b.checkIn,b.checkOut)}</td>
     <td>${b.guests||'—'}</td>
-    <td>${money(bookingTotal(b))}</td>
+    <td><b>${money(bookingGrandTotal(b))}</b>${bookingExtras(b)?`<br><small style="color:var(--muted)">room ${money(bookingTotal(b))} + extras ${money(bookingExtras(b))}</small>`:''}${b.deposit?`<br><small style="color:var(--muted)">deposit ${money(b.deposit)}${b.depositStatus==='returned'?' ↩ returned':b.depositStatus==='held'?' • held':''}</small>`:''}</td>
     <td><span class="status-tag status-${b.status}">${b.status}</span></td>
     <td style="white-space:nowrap;text-align:right">
+      ${b.phone?`<button class="btn sm" data-wa="${b.id}" title="Message guest on WhatsApp">💬</button>`:''}
       <button class="btn sm" data-edit="${b.id}">Edit</button>
       <button class="btn sm danger" data-del="${b.id}">Delete</button>
     </td>
   </tr>`).join('');
   body.querySelectorAll('[data-edit]').forEach(el=>el.onclick=()=>openBookingForm(el.dataset.edit));
   body.querySelectorAll('[data-del]').forEach(el=>el.onclick=()=>delBooking(el.dataset.del));
+  body.querySelectorAll('[data-wa]').forEach(el=>el.onclick=()=>openWhatsApp(db.bookings.find(x=>x.id===el.dataset.wa)));
 }
 ['searchInput','filterSource','filterStatus'].forEach(id=>
   document.getElementById(id).addEventListener('input',renderBookings));
@@ -772,28 +792,52 @@ function openBookingForm(id){
       <div class="field"><label>Phone</label><input type="tel" id="f_phone" value="${esc(v.phone||'')}" placeholder="Optional"></div>
       <div class="field"><label>Email</label><input type="email" id="f_email" value="${esc(v.email||'')}" placeholder="Optional"></div>
     </div>
+    <div style="font-weight:700;font-size:13px;margin:6px 0 10px;color:var(--muted);text-transform:uppercase;letter-spacing:.03em">Extra charges &amp; deposit</div>
+    <div class="row3">
+      <div class="field"><label>Cleaning fee (₹)</label><input type="number" id="f_clean" min="0" step="1" value="${v.cleaningFee||''}" placeholder="0"></div>
+      <div class="field"><label>Extra guest charge (₹)</label><input type="number" id="f_extra" min="0" step="1" value="${v.extraCharge||''}" placeholder="0"></div>
+      <div class="field"><label>Security deposit (₹)</label><input type="number" id="f_deposit" min="0" step="1" value="${v.deposit||''}" placeholder="0"></div>
+    </div>
+    <div class="field"><label>Deposit status</label>
+      <select id="f_depstatus">
+        <option value="na" ${(v.depositStatus||'na')==='na'?'selected':''}>No deposit / not applicable</option>
+        <option value="held" ${v.depositStatus==='held'?'selected':''}>Held</option>
+        <option value="returned" ${v.depositStatus==='returned'?'selected':''}>Returned to guest</option>
+      </select>
+    </div>
+    <div class="calc-note" id="grandNote"></div>
     <div class="field"><label>Notes</label><textarea id="f_notes" rows="2" placeholder="Special requests, etc.">${esc(v.notes||'')}</textarea></div>
   `,[
     {label:b?'Save changes':'Add booking',cls:'btn primary',act:saveBooking}
   ]);
 
   const ci=document.getElementById('f_ci'),co=document.getElementById('f_co'),
-        total=document.getElementById('f_total'),note=document.getElementById('calcNote');
+        total=document.getElementById('f_total'),note=document.getElementById('calcNote'),
+        grand=document.getElementById('grandNote');
   function recalc(){
+    let sum=0;
     if(ci.value&&co.value&&co.value>ci.value){
       const n=nights(ci.value,co.value);
-      let sum=0;bookingDatesRange(ci.value,co.value).forEach(d=>sum+=priceForDate(d));
+      bookingDatesRange(ci.value,co.value).forEach(d=>sum+=priceForDate(d));
       total.value=sum;
-      note.innerHTML=`<b>${n}</b> night(s) · total <b>${money(sum)}</b>, calculated from your nightly prices. Adjust it on the <b>Pricing</b> tab.`;
+      note.innerHTML=`<b>${n}</b> night(s) · room <b>${money(sum)}</b>, calculated from your nightly prices. Adjust it on the <b>Pricing</b> tab.`;
     } else { total.value=''; note.textContent='Select valid dates (check-out must be after check-in).'; }
+    const extras=(Number(val('f_clean'))||0)+(Number(val('f_extra'))||0);
+    const dep=Number(val('f_deposit'))||0, depSt=val('f_depstatus');
+    const depTxt=dep?` · deposit <b>${money(dep)}</b> ${depSt==='returned'?'(returned)':depSt==='held'?'(held)':''}`:'';
+    grand.innerHTML=`Guest pays <b>${money(sum+extras)}</b>${extras?` (room ${money(sum)} + extras ${money(extras)})`:''}${depTxt}`;
   }
-  ci.addEventListener('change',recalc);co.addEventListener('change',recalc);recalc();
+  ci.addEventListener('change',recalc);co.addEventListener('change',recalc);
+  ['f_clean','f_extra','f_deposit','f_depstatus'].forEach(id=>document.getElementById(id).addEventListener('input',recalc));
+  recalc();
 
   function saveBooking(){
     const data={
       source:val('f_source'),guest:val('f_guest').trim(),checkIn:val('f_ci'),checkOut:val('f_co'),
       guests:Number(val('f_guests'))||1,total:Number(val('f_total'))||0,status:val('f_status'),
       phone:val('f_phone').trim(),email:val('f_email').trim(),notes:val('f_notes').trim(),
+      cleaningFee:Number(val('f_clean'))||0,extraCharge:Number(val('f_extra'))||0,
+      deposit:Number(val('f_deposit'))||0,depositStatus:val('f_depstatus'),
       propertyId:document.getElementById('f_property')?val('f_property'):(b?b.propertyId:activePropId()),
     };
     if(!data.guest){toast('Please enter a guest name');return;}
@@ -806,6 +850,26 @@ function openBookingForm(id){
   }
 }
 function bookingDatesRange(ci,co){const out=[];let d=parseISO(ci);const e=parseISO(co);while(d<e){out.push(iso(d));d.setDate(d.getDate()+1);}return out;}
+/* ---- WhatsApp guest messaging ---- */
+// normalise a phone number for wa.me: digits only, default to India (+91) for bare 10-digit numbers
+function waNumber(phone){
+  let d=String(phone||'').replace(/\D/g,'');
+  if(!d)return'';
+  if(d.length===10)d='91'+d;                 // bare Indian mobile
+  else if(d.length===11&&d[0]==='0')d='91'+d.slice(1); // leading 0
+  return d;
+}
+function waMessage(b){
+  const place=propName(b.propertyId);
+  return `Hi ${b.guest||'there'}, this is regarding your stay${place&&place!=='—'?` at ${place}`:''} `
+       + `from ${fmtDate(b.checkIn)} to ${fmtDate(b.checkOut)}. Looking forward to hosting you!`;
+}
+function openWhatsApp(b){
+  if(!b)return;
+  const n=waNumber(b.phone);
+  if(!n){ toast('No phone number on this booking'); return; }
+  window.open(`https://wa.me/${n}?text=${encodeURIComponent(waMessage(b))}`,'_blank');
+}
 function findClash(data,ignoreId){
   if(data.status==='cancelled')return null;
   const pid=data.propertyId||activePropId();
@@ -993,6 +1057,7 @@ function renderReport(){
     const dates=bookingDates(b).filter(d=>d.startsWith(ym));
     if(!dates.length)return;
     let rev=0;dates.forEach(d=>rev+=priceForDate(d,b.propertyId));
+    if((b.checkIn||'').startsWith(ym))rev+=bookingExtras(b); // add cleaning/extra fees in the check-in month
     nightsCount+=dates.length;gross+=rev;
     bySource[b.source]=(bySource[b.source]||0)+rev;
     bRows.push({b,n:dates.length,rev});
@@ -1478,6 +1543,73 @@ document.getElementById('themeBtn').onclick=()=>{
 };
 setThemeLabel(); // match the button + status-bar colour to the theme applied in <head>
 
+/* ============================ Global search & keyboard shortcuts ============================ */
+function globalSearch(q){
+  q=q.toLowerCase().trim(); if(!q)return[];
+  const res=[];
+  db.bookings.forEach(b=>{
+    const hay=`${b.guest||''} ${srcName(b.source)} ${b.notes||''} ${b.phone||''} ${b.email||''} ${b.checkIn||''} ${b.checkOut||''} ${propName(b.propertyId)}`.toLowerCase();
+    if(hay.includes(q))res.push({type:'booking',b});
+  });
+  db.expenses.forEach(e=>{
+    const hay=`${e.category||''} ${e.note||''} ${e.amount||''} ${e.date||''} ${propName(e.propertyId)} ${partnerName(e.paidBy)}`.toLowerCase();
+    if(hay.includes(q))res.push({type:'expense',e});
+  });
+  (db.properties||[]).forEach(p=>{ if((p.name||'').toLowerCase().includes(q))res.push({type:'property',p}); });
+  return res.slice(0,40);
+}
+function openSearch(){
+  modal('Search everything',
+   `<input id="gSearch" type="search" placeholder="Guest, source, note, amount, date, property…"
+      style="width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:10px;font-size:15px;font-family:inherit;background:var(--card);color:var(--ink)">
+    <div id="gResults" style="margin-top:14px;max-height:52vh;overflow:auto"></div>`,[]);
+  const inp=document.getElementById('gSearch'), out=document.getElementById('gResults');
+  function go(r){ closeModal();
+    if(r.type==='booking')openBookingForm(r.b.id);
+    else if(r.type==='expense'){ show('expenses'); openExpenseForm(r.e.id); }
+    else { db.currentProperty=r.p.id; save(); renderPropSelect(); show(currentView); toast('Switched to '+r.p.name); }
+  }
+  function render(){
+    const res=globalSearch(inp.value);
+    if(!inp.value.trim()){ out.innerHTML='<p style="color:var(--muted);margin:6px 2px">Type to search bookings, expenses and properties.</p>'; return; }
+    if(!res.length){ out.innerHTML='<p style="color:var(--muted);margin:6px 2px">No matches.</p>'; return; }
+    out.innerHTML=res.map((r,i)=>{
+      if(r.type==='booking'){const b=r.b;return `<div class="search-row" data-i="${i}"><span class="src-tag" style="background:${srcColor(b.source)}">${srcName(b.source)}</span><b>${esc(b.guest||'Guest')}</b><small style="color:var(--muted);margin-left:auto;white-space:nowrap">${fmtShort(b.checkIn)}→${fmtShort(b.checkOut)} · ${money(bookingGrandTotal(b))}</small></div>`;}
+      if(r.type==='expense'){const e=r.e;return `<div class="search-row" data-i="${i}"><span class="cat-tag">${esc(e.category||'')}</span><small style="color:var(--muted)">${esc(e.note||'')||'(no note)'}</small><small style="color:var(--muted);margin-left:auto;white-space:nowrap">${fmtShort(e.date)} · ${money(e.amount)}</small></div>`;}
+      const p=r.p;return `<div class="search-row" data-i="${i}">🏠 <b>${esc(p.name)}</b><small style="color:var(--muted);margin-left:auto">property</small></div>`;
+    }).join('');
+    out.querySelectorAll('.search-row').forEach(el=>el.onclick=()=>go(res[Number(el.dataset.i)]));
+  }
+  inp.addEventListener('input',render);
+  inp.addEventListener('keydown',ev=>{ if(ev.key==='Enter'){ const res=globalSearch(inp.value); if(res.length)go(res[0]); } });
+  render(); setTimeout(()=>inp.focus(),60);
+}
+document.getElementById('searchBtn').onclick=openSearch;
+
+function showShortcuts(){
+  modal('Keyboard shortcuts',
+   `<div style="font-size:14px;line-height:2.2">
+      <span class="kbd">/</span> or <span class="kbd">Ctrl</span>+<span class="kbd">K</span> — Search everything<br>
+      <span class="kbd">1</span>…<span class="kbd">6</span> — Dashboard · Calendar · Bookings · Expenses · Pricing · Report<br>
+      <span class="kbd">N</span> — New booking &nbsp; <span class="kbd">T</span> — Toggle dark mode<br>
+      <span class="kbd">?</span> — This help &nbsp; <span class="kbd">Esc</span> — Close dialog
+    </div>`,[]);
+}
+document.addEventListener('keydown',e=>{
+  // disable shortcuts while a dialog is open (Esc closes it) or while typing in a field
+  if(document.getElementById('modalRoot').innerHTML.trim())return;
+  const tag=(e.target&&e.target.tagName||'').toLowerCase();
+  if(tag==='input'||tag==='textarea'||tag==='select'||(e.target&&e.target.isContentEditable))return;
+  if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='k'){ e.preventDefault(); openSearch(); return; }
+  if(e.ctrlKey||e.metaKey||e.altKey)return;
+  const k=e.key;
+  if(k==='/'){ e.preventDefault(); openSearch(); }
+  else if(k>='1'&&k<='6'){ show(views[Number(k)-1]); }
+  else if(k==='n'||k==='N'){ openBookingForm(); }
+  else if(k==='t'||k==='T'){ document.getElementById('themeBtn').click(); }
+  else if(k==='?'){ showShortcuts(); }
+});
+
 /* ============================ Modal helpers ============================ */
 function modal(title,bodyHtml,buttons){
   const root=document.getElementById('modalRoot');
@@ -1513,10 +1645,12 @@ function downloadCSV(filename,rows){
   toast('Excel file downloaded');
 }
 function exportBookings(){
-  const rows=[['Property','Guest','Source','Check-in','Check-out','Nights','Guests','Total (₹)','Status','Phone','Email','Notes']];
+  const dep={na:'',held:'Held',returned:'Returned'};
+  const rows=[['Property','Guest','Source','Check-in','Check-out','Nights','Guests','Room (₹)','Cleaning (₹)','Extra (₹)','Total (₹)','Deposit (₹)','Deposit status','Status','Phone','Email','Notes']];
   filteredBookings().forEach(b=>rows.push([
     propName(b.propertyId), b.guest||'', srcName(b.source), b.checkIn, b.checkOut,
-    nights(b.checkIn,b.checkOut), b.guests||'', bookingTotal(b), b.status||'',
+    nights(b.checkIn,b.checkOut), b.guests||'', bookingTotal(b), Number(b.cleaningFee||0), Number(b.extraCharge||0),
+    bookingGrandTotal(b), Number(b.deposit||0), dep[b.depositStatus||'na']||'', b.status||'',
     b.phone||'', b.email||'', b.notes||'' ]));
   downloadCSV(`bookings-${todayISO}.csv`,rows);
 }
