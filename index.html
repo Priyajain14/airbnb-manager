@@ -291,6 +291,7 @@
     <h1 class="page">Dashboard</h1>
     <p class="sub">Your bookings at a glance.</p>
     <div class="grid stats" id="statCards"></div>
+    <div id="rentCoverage" style="margin-top:18px"></div>
     <div class="grid" style="grid-template-columns:1fr 1fr;margin-top:18px" id="dashLower">
       <div class="card">
         <p class="section-title">Upcoming check-ins</p>
@@ -348,7 +349,7 @@
       <div class="table-scroll"><table id="bookingsTable">
         <thead><tr>
           <th>Guest</th><th>Source</th><th>Check-in</th><th>Check-out</th>
-          <th>Nights</th><th>Guests</th><th>Total</th><th>Status</th><th></th>
+          <th>Nights</th><th>Guests</th><th>Total</th><th>Net profit</th><th>Status</th><th></th>
         </tr></thead>
         <tbody id="bookingsBody"></tbody>
       </table></div>
@@ -364,13 +365,29 @@
     <h1 class="page">Pricing</h1>
     <p class="sub">Set your standard nightly rate and override prices for special dates.</p>
     <div class="card" style="max-width:420px;margin-bottom:20px">
-      <div class="field" style="margin:0">
+      <div class="field" style="margin:0 0 16px">
         <label>Default nightly price</label>
         <div style="display:flex;gap:10px">
           <input type="number" id="basePrice" min="0" step="1" style="flex:1;padding:10px 12px;border:1px solid var(--line);border-radius:10px;font-size:15px">
           <button class="btn primary" id="saveBasePrice">Save</button>
         </div>
         <p style="color:var(--muted);font-size:12.5px;margin:8px 0 0">This rate applies to every night unless you set a custom price below or on the calendar.</p>
+      </div>
+      <div class="field" style="margin:0 0 16px">
+        <label>Running cost / night</label>
+        <div style="display:flex;gap:10px">
+          <input type="number" id="nightlyCost" min="0" step="1" style="flex:1;padding:10px 12px;border:1px solid var(--line);border-radius:10px;font-size:15px">
+          <button class="btn primary" id="saveNightlyCost">Save</button>
+        </div>
+        <p style="color:var(--muted);font-size:12.5px;margin:8px 0 0">Your typical cost to host one night — cleaning, utilities, supplies, internet. Used to estimate each booking's profit. You can still tag one-off expenses to a specific booking.</p>
+      </div>
+      <div class="field" style="margin:0">
+        <label>Monthly rent / fixed cost</label>
+        <div style="display:flex;gap:10px">
+          <input type="number" id="monthlyFixed" min="0" step="1" style="flex:1;padding:10px 12px;border:1px solid var(--line);border-radius:10px;font-size:15px">
+          <button class="btn primary" id="saveMonthlyFixed">Save</button>
+        </div>
+        <p style="color:var(--muted);font-size:12.5px;margin:8px 0 0" id="rentHint">Fixed monthly cost like rent. It's spread across the month so each booking carries its share (rent ÷ days in month, per night).</p>
       </div>
     </div>
     <div class="card">
@@ -470,6 +487,9 @@ function migrateDB(o){
       overrides:(o.overrides&&typeof o.overrides==='object')?o.overrides:{}};
   }
   o.properties.forEach(p=>{ if(!o.pricing[p.id])o.pricing[p.id]={basePrice:75,overrides:{}}; });
+  // per-property running cost / night + monthly fixed cost/rent (used for per-booking profit); default 0
+  o.properties.forEach(p=>{ if(typeof o.pricing[p.id].nightlyCost!=='number')o.pricing[p.id].nightlyCost=0; });
+  o.properties.forEach(p=>{ if(typeof o.pricing[p.id].monthlyFixed!=='number')o.pricing[p.id].monthlyFixed=0; });
   // tag every record with a property
   (o.bookings||[]).forEach(b=>{ if(!b.propertyId)b.propertyId=first; });
   (o.expenses||[]).forEach(e=>{ if(!e.propertyId)e.propertyId=first; });
@@ -519,6 +539,29 @@ function bookingTotal(b){ let s=0; bookingDates(b).forEach(d=>s+=priceForDate(d,
 function bookingExtras(b){ return Number(b.cleaningFee||0)+Number(b.extraCharge||0); }
 // what the guest actually pays for the stay (nights + add-ons), excluding any refundable deposit
 function bookingGrandTotal(b){ return bookingTotal(b)+bookingExtras(b); }
+/* ---- per-booking profit (P&L) ---- */
+// the typical operating cost per night for a property (cleaning, utilities, supplies, internet share…)
+function nightlyCostFor(pid){ return Number(pricingFor(pid||activePropId()).nightlyCost||0); }
+// fixed monthly cost for a property (rent, etc.) — spread across the month, per night
+function monthlyFixedFor(pid){ return Number(pricingFor(pid||activePropId()).monthlyFixed||0); }
+function daysInMonth(y,m){ return new Date(y,m,0).getDate(); } // m is 1-based
+// each night carries a slice of the month's rent = rent ÷ days in that night's month
+function rentShareForNight(isoStr,pid){ const mf=monthlyFixedFor(pid); if(!mf)return 0; const[y,m]=isoStr.split('-').map(Number); return mf/daysInMonth(y,m); }
+function rentShareForRange(dates,pid){ return dates.reduce((s,d)=>s+rentShareForNight(d,pid),0); }
+// expenses you've directly tagged to this specific booking
+function bookingLinkedExpenses(b){ return db.expenses.filter(e=>e.bookingId===b.id); }
+function bookingLinkedTotal(b){ return bookingLinkedExpenses(b).reduce((s,e)=>s+Number(e.amount||0),0); }
+// full profit breakdown for one stay: revenue − running cost − rent share − tagged expenses
+function bookingProfit(b){
+  const revenue=bookingGrandTotal(b);
+  const n=nights(b.checkIn,b.checkOut);
+  const running=n*nightlyCostFor(b.propertyId);
+  const rent=rentShareForRange(bookingDates(b),b.propertyId);
+  const linked=bookingLinkedTotal(b);
+  const cost=running+rent+linked;
+  const net=revenue-cost;
+  return {revenue,nights:n,running,rent,linked,cost,net,margin:revenue>0?net/revenue:0};
+}
 const curYM=()=>{const n=new Date();return `${n.getFullYear()}-${pad(n.getMonth()+1)}`;};
 function shiftYM(ym,delta){let[y,m]=ym.split('-').map(Number);m+=delta;while(m<1){m+=12;y--;}while(m>12){m-=12;y++;}return `${y}-${pad(m)}`;}
 // non-cancelled bookings for the current property (or all properties when 'all' is selected)
@@ -611,6 +654,40 @@ function renderDashboard(){
     ${stat('Revenue this month',money(monthRev))}
     ${stat('Expenses this month',money(monthExp))}
     ${stat('Net profit this month','<span style="color:'+(net>=0?'var(--ok)':'#c0392b')+'">'+money(net)+'</span>')}`;
+
+  // ----- Rent coverage: is this month's rent being covered by bookings? -----
+  const rentProps=isAllProps()?db.properties.map(p=>p.id):[db.currentProperty];
+  const rentDue=rentProps.reduce((s,pid)=>s+monthlyFixedFor(pid),0);
+  const rcEl=document.getElementById('rentCoverage');
+  if(rentDue>0){
+    let rentRecovered=0;
+    act.forEach(b=>bookingDates(b).forEach(d=>{ if(d.startsWith(ym))rentRecovered+=rentShareForNight(d,b.propertyId); }));
+    const pct=Math.min(100,Math.round(rentRecovered/rentDue*100));
+    const covered=rentRecovered>=rentDue-1;
+    const gap=Math.max(0,rentDue-rentRecovered);
+    const daysIn=new Date(now.getFullYear(),now.getMonth()+1,0).getDate();
+    const barColor=covered?'var(--ok)':(pct>=60?'#e6a700':'#c0392b');
+    const monthName=now.toLocaleDateString(undefined,{month:'long',year:'numeric'});
+    rcEl.innerHTML=`<div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:6px">
+        <p class="section-title" style="margin:0">Rent coverage <span style="color:var(--muted);font-weight:400;font-size:13px">· ${monthName}${isAllProps()?' · all properties':''}</span></p>
+        <div style="font-weight:800;font-size:15px;color:${barColor}">${pct}% covered</div>
+      </div>
+      <div style="height:12px;border-radius:8px;background:var(--bg);border:1px solid var(--line);overflow:hidden;margin:12px 0 10px">
+        <div style="height:100%;width:${pct}%;background:${barColor};transition:width .3s"></div>
+      </div>
+      <div style="display:flex;gap:18px;flex-wrap:wrap;font-size:14px">
+        <div><span style="color:var(--muted)">Rent due</span> <b>${money(rentDue)}</b></div>
+        <div><span style="color:var(--muted)">Recovered by bookings</span> <b>${money(rentRecovered)}</b></div>
+        <div><span style="color:var(--muted)">${monthNights} of ${daysIn} nights booked</span></div>
+      </div>
+      <div style="margin-top:10px;font-size:14px;color:${covered?'var(--ok)':'var(--muted)'}">
+        ${covered
+          ?`✓ Bookings cover this month's rent — every further night is profit toward your costs.`
+          :`Still <b style="color:${barColor}">${money(gap)}</b> of rent not yet covered by bookings this month. Fill more nights to close the gap.`}
+      </div>
+    </div>`;
+  } else { rcEl.innerHTML=''; }
 
   document.getElementById('upcomingList').innerHTML = upcoming.length
     ? upcoming.slice(0,6).map(b=>miniItem(b)).join('')
@@ -735,6 +812,7 @@ function renderBookings(){
     <td>${nights(b.checkIn,b.checkOut)}</td>
     <td>${b.guests||'—'}</td>
     <td><b>${money(bookingGrandTotal(b))}</b>${bookingExtras(b)?`<br><small style="color:var(--muted)">room ${money(bookingTotal(b))} + extras ${money(bookingExtras(b))}</small>`:''}${b.deposit?`<br><small style="color:var(--muted)">deposit ${money(b.deposit)}${b.depositStatus==='returned'?' ↩ returned':b.depositStatus==='held'?' • held':''}</small>`:''}</td>
+    ${(()=>{ if(b.status==='cancelled')return '<td style="color:var(--muted)">—</td>'; const p=bookingProfit(b); return `<td><b style="color:${p.net>=0?'var(--ok)':'#c0392b'}">${money(p.net)}</b>${p.cost>0?`<br><small style="color:var(--muted)">${Math.round(p.margin*100)}% margin · cost ${money(p.cost)}</small>`:'<br><small style="color:var(--muted)">set running cost</small>'}</td>`; })()}
     <td><span class="status-tag status-${b.status}">${b.status}</span></td>
     <td style="white-space:nowrap;text-align:right">
       ${b.phone?`<button class="btn sm" data-wa="${b.id}" title="Message guest on WhatsApp">💬</button>`:''}
@@ -806,6 +884,7 @@ function openBookingForm(id){
       </select>
     </div>
     <div class="calc-note" id="grandNote"></div>
+    <div id="profitNote" style="margin:10px 0 4px;padding:12px 14px;border:1px solid var(--line);border-radius:12px;background:var(--bg);font-size:14px;line-height:1.7"></div>
     <div class="field"><label>Notes</label><textarea id="f_notes" rows="2" placeholder="Special requests, etc.">${esc(v.notes||'')}</textarea></div>
   `,[
     {label:b?'Save changes':'Add booking',cls:'btn primary',act:saveBooking}
@@ -826,6 +905,32 @@ function openBookingForm(id){
     const dep=Number(val('f_deposit'))||0, depSt=val('f_depstatus');
     const depTxt=dep?` · deposit <b>${money(dep)}</b> ${depSt==='returned'?'(returned)':depSt==='held'?'(held)':''}`:'';
     grand.innerHTML=`Guest pays <b>${money(sum+extras)}</b>${extras?` (room ${money(sum)} + extras ${money(extras)})`:''}${depTxt}`;
+    // live profit breakdown
+    const pn=document.getElementById('profitNote');
+    if(pn){
+      const n=(ci.value&&co.value&&co.value>ci.value)?nights(ci.value,co.value):0;
+      const pid=document.getElementById('f_property')?val('f_property'):(b?b.propertyId:activePropId());
+      const perNight=nightlyCostFor(pid);
+      const running=n*perNight;
+      const mFixed=monthlyFixedFor(pid);
+      const rent=n>0?rentShareForRange(bookingDatesRange(ci.value,co.value),pid):0;
+      const linked=b?bookingLinkedTotal(b):0;
+      const revenue=sum+extras;
+      const cost=running+rent+linked;
+      const net=revenue-cost;
+      const margin=revenue>0?Math.round(net/revenue*100):0;
+      const row=(label,amt,opts={})=>`<div style="display:flex;justify-content:space-between"><span style="color:var(--muted)">${label}</span><span style="${opts.color?`color:${opts.color};`:''}${opts.bold?'font-weight:800;':''}">${opts.neg?'−':''}${money(amt)}</span></div>`;
+      pn.innerHTML=`<div style="font-weight:700;font-size:12px;text-transform:uppercase;letter-spacing:.03em;color:var(--muted);margin-bottom:6px">Profit on this booking</div>`+
+        row('Revenue (room + fees)',revenue)+
+        row(`Running cost · ${n} × ${money(perNight)}`,running,{neg:true})+
+        (mFixed>0?row(`Rent share · ${n} night(s)`,rent,{neg:true}):'')+
+        (linked>0?row('Tagged expenses',linked,{neg:true}):'')+
+        `<div style="border-top:1px solid var(--line);margin:6px 0"></div>`+
+        row('Net profit',net,{bold:true,color:net>=0?'var(--ok)':'#c0392b'})+
+        `<div style="text-align:right;color:var(--muted);font-size:12.5px;margin-top:2px">${revenue>0?margin+'% margin':''}</div>`+
+        (perNight===0&&mFixed===0?`<div style="color:var(--muted);font-size:12.5px;margin-top:6px">💡 Set a <b>running cost / night</b> and <b>monthly rent</b> on the Pricing tab to estimate costs automatically.</div>`:'')+
+        (b&&linked>0?`<div style="color:var(--muted);font-size:12.5px;margin-top:4px">Includes ${bookingLinkedExpenses(b).length} expense(s) tagged to this booking.</div>`:'');
+    }
   }
   ci.addEventListener('change',recalc);co.addEventListener('change',recalc);
   ['f_clean','f_extra','f_deposit','f_depstatus'].forEach(id=>document.getElementById(id).addEventListener('input',recalc));
@@ -882,6 +987,8 @@ function renderPricing(){
   const bp=document.getElementById('basePrice');
   if(isAllProps()){
     bp.value=''; bp.disabled=true;
+    const nc=document.getElementById('nightlyCost'); nc.value=''; nc.disabled=true;
+    const mfx=document.getElementById('monthlyFixed'); mfx.value=''; mfx.disabled=true;
     document.getElementById('overrideEmpty').classList.add('hidden');
     document.getElementById('overrideBody').innerHTML='<tr><td colspan="4" style="color:var(--muted);padding:18px">Select a specific property (top-left) to set its prices.</td></tr>';
     return;
@@ -889,6 +996,12 @@ function renderPricing(){
   bp.disabled=false;
   const pr=pricingFor(activePropId());
   bp.value=pr.basePrice;
+  const nc=document.getElementById('nightlyCost'); nc.disabled=false; nc.value=pr.nightlyCost||0;
+  const mfx=document.getElementById('monthlyFixed'); mfx.disabled=false; mfx.value=pr.monthlyFixed||0;
+  const mf=Number(pr.monthlyFixed||0);
+  document.getElementById('rentHint').innerHTML=mf>0
+    ?`Fixed monthly cost like rent, spread across the month. ≈ <b>${money(mf/30.44)}</b>/night — each booking carries its share.`
+    :`Fixed monthly cost like rent. It's spread across the month so each booking carries its share (rent ÷ days in month, per night).`;
   const entries=Object.entries(pr.overrides).sort((a,b)=>a[0].localeCompare(b[0]));
   document.getElementById('overrideEmpty').classList.toggle('hidden',entries.length>0);
   document.getElementById('overrideBody').innerHTML=entries.map(([d,o])=>`<tr>
@@ -906,6 +1019,16 @@ document.getElementById('saveBasePrice').onclick=()=>{
   if(isAllProps()){toast('Pick a specific property first');return;}
   const v=Number(document.getElementById('basePrice').value);
   if(v>=0){pricingFor(activePropId()).basePrice=v;save();toast('Default price saved');refreshAll();}
+};
+document.getElementById('saveNightlyCost').onclick=()=>{
+  if(isAllProps()){toast('Pick a specific property first');return;}
+  const v=Number(document.getElementById('nightlyCost').value);
+  if(v>=0){pricingFor(activePropId()).nightlyCost=v;save();toast('Running cost saved');refreshAll();}
+};
+document.getElementById('saveMonthlyFixed').onclick=()=>{
+  if(isAllProps()){toast('Pick a specific property first');return;}
+  const v=Number(document.getElementById('monthlyFixed').value);
+  if(v>=0){pricingFor(activePropId()).monthlyFixed=v;save();toast('Monthly rent saved');refreshAll();}
 };
 document.getElementById('addOverrideBtn').onclick=()=>openDay(todayISO);
 
@@ -946,7 +1069,7 @@ function renderExpenses(){
     <td>${fmtDate(e.date)}${isAllProps()?`<br><small style="color:var(--brand);font-weight:700">${esc(propName(e.propertyId))}</small>`:''}</td>
     <td><span class="cat-tag">${esc(e.category)}</span></td>
     <td>${e.paidBy?`<span class="who-tag">${esc(partnerName(e.paidBy))}</span>`:'<span style="color:var(--muted)">—</span>'}</td>
-    <td style="color:var(--muted)">${esc(e.note||'')}</td>
+    <td style="color:var(--muted)">${esc(e.note||'')}${(()=>{const bk=e.bookingId&&db.bookings.find(x=>x.id===e.bookingId);return bk?`${e.note?'<br>':''}<small style="color:var(--brand);font-weight:700">🔗 ${esc(bk.guest||'booking')} · ${fmtShort(bk.checkIn)}</small>`:'';})()}</td>
     <td><b>${money(e.amount)}</b></td>
     <td style="text-align:right;white-space:nowrap">
       <button class="btn sm" data-eedit="${e.id}">Edit</button>
@@ -1031,10 +1154,16 @@ function openExpenseForm(id){
       <div class="field"><label>Paid by</label>
         <select id="e_paidby">${(db.partners||[]).map(p=>`<option value="${p.id}" ${v.paidBy===p.id?'selected':''}>${esc(p.name)}</option>`).join('')}</select></div>
     </div>
+    <div class="field"><label>Link to booking <span style="color:var(--muted);font-weight:400">(optional)</span></label>
+      <select id="e_booking">
+        <option value="">— General / not booking-specific —</option>
+        ${db.bookings.slice().sort((a,b)=>b.checkIn.localeCompare(a.checkIn)).map(bk=>`<option value="${bk.id}" ${v.bookingId===bk.id?'selected':''}>${esc(bk.guest||'Guest')} · ${fmtShort(bk.checkIn)}–${fmtShort(bk.checkOut)}${db.properties.length>1?' · '+esc(propName(bk.propertyId)):''}</option>`).join('')}
+      </select>
+      <p style="color:var(--muted);font-size:12px;margin:6px 0 0">Tag this cost to one stay and it counts against that booking's profit.</p></div>
     <div class="field"><label>Note</label>
       <input type="text" id="e_note" value="${esc(v.note||'')}" placeholder="e.g. Cleaner for 12 May turnover"></div>
   `,[{label:e?'Save changes':'Add expense',cls:'btn primary',act:()=>{
-    const data={date:val('e_date'),amount:Number(val('e_amount'))||0,category:val('e_cat'),note:val('e_note').trim(),paidBy:val('e_paidby'),propertyId:document.getElementById('e_property')?val('e_property'):(e?e.propertyId:activePropId())};
+    const data={date:val('e_date'),amount:Number(val('e_amount'))||0,category:val('e_cat'),note:val('e_note').trim(),paidBy:val('e_paidby'),bookingId:val('e_booking')||'',propertyId:document.getElementById('e_property')?val('e_property'):(e?e.propertyId:activePropId())};
     if(!data.date){toast('Please pick a date');return;}
     if(!data.amount){toast('Please enter an amount');return;}
     if(e)Object.assign(e,data);
